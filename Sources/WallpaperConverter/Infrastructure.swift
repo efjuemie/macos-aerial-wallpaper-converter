@@ -30,7 +30,16 @@ enum AppPaths {
     static let logURL = home.appendingPathComponent(
         "Library/Logs/WallpaperConverter.log"
     )
-    static let desktopArchiveDirectory = home.appendingPathComponent(
+    static let archiveDirectory = appSupport.appendingPathComponent(
+        "壁纸",
+        isDirectory: true
+    )
+    static let previewDirectory = archiveDirectory.appendingPathComponent(
+        "预览",
+        isDirectory: true
+    )
+    static let archiveMetadataURL = archiveDirectory.appendingPathComponent("metadata.json")
+    static let legacyDesktopArchiveDirectory = home.appendingPathComponent(
         "Desktop/壁纸",
         isDirectory: true
     )

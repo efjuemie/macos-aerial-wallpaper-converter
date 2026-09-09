@@ -42,6 +42,36 @@ struct BackupEntry: Identifiable, Hashable, Sendable {
     }
 }
 
+struct WallpaperArchiveMetadata: Codable, Sendable {
+    let uuid: String?
+    var displayName: String
+}
+
+struct WallpaperArchiveEntry: Identifiable, Hashable, Sendable {
+    let url: URL
+    let previewURL: URL
+    let number: Int
+    let uuid: String?
+    let displayName: String
+
+    var id: URL { url }
+
+    var defaultDisplayName: String {
+        url.deletingPathExtension().lastPathComponent
+    }
+
+    var editableName: String {
+        let prefix = "\(number)-"
+        guard displayName.hasPrefix(prefix) else { return displayName }
+        return String(displayName.dropFirst(prefix.count))
+    }
+}
+
+struct VideoCanvasSize: Hashable, Sendable {
+    let width: Int
+    let height: Int
+}
+
 struct EnvironmentCheck: Identifiable, Sendable {
     let id = UUID()
     let name: String
@@ -81,6 +111,7 @@ struct OperationReport: Sendable {
     let outputURL: URL
     let reloadWarning: String?
     let isRestore: Bool
+    let isArchiveReplacement: Bool
 }
 
 extension DateFormatter {

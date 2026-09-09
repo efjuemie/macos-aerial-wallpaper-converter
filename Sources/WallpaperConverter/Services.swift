@@ -1,5 +1,15 @@
 import CryptoKit
+@preconcurrency import AVFoundation
+import AppKit
 import Foundation
+
+private final class ExportSessionBox: @unchecked Sendable {
+    let session: AVAssetExportSession
+
+    init(_ session: AVAssetExportSession) {
+        self.session = session
+    }
+}
 
 enum EncoderService {
     static let repositoryURL = "https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix.git"
@@ -80,12 +90,38 @@ enum EncoderService {
         return executable
     }
 
-    static func encode(input: URL, output: URL, loopCount: Int, bitrateMbps: Int, executable: URL) async throws {
+    static func encode(
+        input: URL,
+        output: URL,
+        loopCount: Int,
+        bitrateMbps: Int,
+        executable: URL,
+        canvasSize: VideoCanvasSize? = nil
+    ) async throws {
         try AppPaths.ensureDirectory(output.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: output)
+        let aspectFitInput: URL?
+        if let canvasSize {
+            let temporaryInput = output.deletingLastPathComponent().appendingPathComponent(
+                ".wallpaper-converter-aspect-\(UUID().uuidString).mov"
+            )
+            try await VideoAspectService.renderAspectFit(
+                input: input,
+                output: temporaryInput,
+                canvasSize: canvasSize
+            )
+            aspectFitInput = temporaryInput
+        } else {
+            aspectFitInput = nil
+        }
+        defer {
+            if let aspectFitInput {
+                try? FileManager.default.removeItem(at: aspectFitInput)
+            }
+        }
         let result = try await CommandRunner.run(
             executable,
-            arguments: [input.path, output.path, String(loopCount), String(bitrateMbps)],
+            arguments: [aspectFitInput?.path ?? input.path, output.path, String(loopCount), String(bitrateMbps)],
             currentDirectory: executable.deletingLastPathComponent()
         )
         guard result.status == 0 else {
@@ -121,6 +157,97 @@ enum EncoderService {
             throw AppError("视频未通过 Aerial 兼容性验证，缺少：\n\(missing.joined(separator: "\n"))\n\n原始验证输出：\n\(result.output)")
         }
         return result.output
+    }
+}
+
+enum VideoAspectService {
+    static func renderAspectFit(input: URL, output: URL, canvasSize: VideoCanvasSize) async throws {
+        let asset = AVURLAsset(url: input)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw AppError("视频中没有可用于比例处理的视频轨道。")
+        }
+        let duration = try await asset.load(.duration)
+        let naturalSize = try await track.load(.naturalSize)
+        let preferredTransform = try await track.load(.preferredTransform)
+        let transformedBounds = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
+        let sourceWidth = max(1, abs(transformedBounds.width))
+        let sourceHeight = max(1, abs(transformedBounds.height))
+        let scale = min(
+            CGFloat(canvasSize.width) / sourceWidth,
+            CGFloat(canvasSize.height) / sourceHeight
+        )
+        let fittedWidth = sourceWidth * scale
+        let fittedHeight = sourceHeight * scale
+        let paddingX = (CGFloat(canvasSize.width) - fittedWidth) / 2
+        let paddingY = (CGFloat(canvasSize.height) - fittedHeight) / 2
+        let transform = CGAffineTransform(
+            a: preferredTransform.a * scale,
+            b: preferredTransform.b * scale,
+            c: preferredTransform.c * scale,
+            d: preferredTransform.d * scale,
+            tx: preferredTransform.tx * scale - transformedBounds.minX * scale + paddingX,
+            ty: preferredTransform.ty * scale - transformedBounds.minY * scale + paddingY
+        )
+
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.renderSize = CGSize(width: canvasSize.width, height: canvasSize.height)
+        let frameRate = try await track.load(.nominalFrameRate)
+        let timescale = Int32(max(1, Int(frameRate.rounded())))
+        videoComposition.frameDuration = CMTime(value: 1, timescale: timescale)
+
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+        instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
+        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+        layerInstruction.setTransform(transform, at: .zero)
+        instruction.layerInstructions = [layerInstruction]
+        videoComposition.instructions = [instruction]
+
+        guard let exporter = AVAssetExportSession(
+            asset: asset,
+            presetName: AVAssetExportPresetHighestQuality
+        ) else {
+            throw AppError("无法创建视频比例处理任务。")
+        }
+        try? FileManager.default.removeItem(at: output)
+        exporter.outputURL = output
+        exporter.outputFileType = .mov
+        exporter.videoComposition = videoComposition
+        exporter.shouldOptimizeForNetworkUse = false
+
+        let exporterBox = ExportSessionBox(exporter)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            exporterBox.session.exportAsynchronously {
+                if exporterBox.session.status == .completed {
+                    continuation.resume()
+                } else {
+                    let detail = exporterBox.session.error?.localizedDescription ?? "未知错误"
+                    continuation.resume(throwing: AppError("视频比例处理失败：\(detail)"))
+                }
+            }
+        }
+        guard FileManager.default.isReadableFile(atPath: output.path) else {
+            throw AppError("视频比例处理没有生成有效文件。")
+        }
+    }
+}
+
+enum PreviewService {
+    static func generateFirstFrame(from video: URL, to destination: URL) async throws {
+        let asset = AVAsset(url: video)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 1920, height: 1080)
+        let result = try await generator.image(at: .zero)
+        let bitmap = NSBitmapImageRep(cgImage: result.image)
+        guard let data = bitmap.representation(
+            using: .jpeg,
+            properties: [.compressionFactor: 0.88]
+        ) else {
+            throw AppError("无法生成动态壁纸首帧预览。")
+        }
+        try AppPaths.ensureDirectory(destination.deletingLastPathComponent())
+        try data.write(to: destination, options: [.atomic])
     }
 }
 
@@ -175,26 +302,139 @@ enum AerialService {
         return destination
     }
 
-    static func archiveOriginalOnDesktop(of target: URL, customName: String? = nil) throws -> URL {
-        try AppPaths.ensureDirectory(AppPaths.desktopArchiveDirectory)
+    static func archiveOriginal(of target: URL, uuid: String, customName: String? = nil) throws -> URL {
+        try AppPaths.ensureDirectory(AppPaths.archiveDirectory)
+        try AppPaths.ensureDirectory(AppPaths.previewDirectory)
         let number = nextArchiveNumber()
         let filename = try archiveFilename(for: target, customName: customName)
-        let destination = AppPaths.desktopArchiveDirectory.appendingPathComponent(
+        let destination = AppPaths.archiveDirectory.appendingPathComponent(
             "\(number)-\(filename)"
         )
         try FileManager.default.copyItem(at: target, to: destination)
-        try verifyNonEmpty(destination)
+        do {
+            try verifyNonEmpty(destination)
+            var metadata = loadArchiveMetadata()
+            metadata[destination.lastPathComponent] = WallpaperArchiveMetadata(
+                uuid: normalizeUUID(uuid),
+                displayName: destination.deletingPathExtension().lastPathComponent
+            )
+            try saveArchiveMetadata(metadata)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
         return destination
+    }
+
+    static func archiveEntries() -> [WallpaperArchiveEntry] {
+        let metadata = loadArchiveMetadata()
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: AppPaths.archiveDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        return urls.compactMap { url in
+            guard url.pathExtension.lowercased() == "mov",
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                return nil
+            }
+            let stem = url.deletingPathExtension().lastPathComponent
+            let number = stem.split(separator: "-", maxSplits: 1).first.flatMap { Int($0) } ?? 0
+            let record = metadata[url.lastPathComponent]
+            return WallpaperArchiveEntry(
+                url: url,
+                previewURL: previewURL(for: url),
+                number: number,
+                uuid: record?.uuid ?? uuidFromArchiveFilename(url),
+                displayName: record?.displayName ?? stem
+            )
+        }.sorted {
+            if $0.number != $1.number { return $0.number > $1.number }
+            return $0.url.lastPathComponent > $1.url.lastPathComponent
+        }
+    }
+
+    static func previewURL(for archiveURL: URL) -> URL {
+        AppPaths.previewDirectory.appendingPathComponent(
+            "\(archiveURL.deletingPathExtension().lastPathComponent).jpg"
+        )
+    }
+
+    static func renameArchive(_ entry: WallpaperArchiveEntry, to name: String) throws {
+        var stem = try normalizedArchiveStem(name)
+        let numberPrefix = "\(entry.number)-"
+        if stem.hasPrefix(numberPrefix) {
+            stem.removeFirst(numberPrefix.count)
+        }
+        guard !stem.isEmpty else {
+            throw AppError("自定义归档名称无效。")
+        }
+        let destination = AppPaths.archiveDirectory.appendingPathComponent(
+            "\(entry.number)-\(stem).mov"
+        )
+        guard destination != entry.url else { return }
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw AppError("该归档名称已存在，请换一个名称。")
+        }
+
+        let oldPreview = entry.previewURL
+        let newPreview = previewURL(for: destination)
+        guard !FileManager.default.fileExists(atPath: newPreview.path) else {
+            throw AppError("该归档名称对应的预览已存在，请换一个名称。")
+        }
+
+        var metadata = loadArchiveMetadata()
+        let oldRecord = metadata.removeValue(forKey: entry.url.lastPathComponent)
+        metadata[destination.lastPathComponent] = WallpaperArchiveMetadata(
+            uuid: entry.uuid ?? oldRecord?.uuid,
+            displayName: destination.deletingPathExtension().lastPathComponent
+        )
+
+        do {
+            try FileManager.default.moveItem(at: entry.url, to: destination)
+            if FileManager.default.fileExists(atPath: oldPreview.path) {
+                try FileManager.default.moveItem(at: oldPreview, to: newPreview)
+            }
+            try saveArchiveMetadata(metadata)
+        } catch {
+            if FileManager.default.fileExists(atPath: newPreview.path),
+               !FileManager.default.fileExists(atPath: oldPreview.path) {
+                try? FileManager.default.moveItem(at: newPreview, to: oldPreview)
+            }
+            if FileManager.default.fileExists(atPath: destination.path),
+               !FileManager.default.fileExists(atPath: entry.url.path) {
+                try? FileManager.default.moveItem(at: destination, to: entry.url)
+            }
+            throw error
+        }
+    }
+
+    static func deleteArchive(_ entry: WallpaperArchiveEntry) throws {
+        if FileManager.default.fileExists(atPath: entry.url.path) {
+            try FileManager.default.removeItem(at: entry.url)
+        }
+        if FileManager.default.fileExists(atPath: entry.previewURL.path) {
+            try FileManager.default.removeItem(at: entry.previewURL)
+        }
+        var metadata = loadArchiveMetadata()
+        metadata.removeValue(forKey: entry.url.lastPathComponent)
+        try saveArchiveMetadata(metadata)
     }
 
     private static func archiveFilename(for target: URL, customName: String?) throws -> String {
         guard let customName else { return target.lastPathComponent }
-        let trimmed = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(try normalizedArchiveStem(customName)).mov"
+    }
+
+    private static func normalizedArchiveStem(_ value: String) throws -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed != ".",
               trimmed != "..",
               !trimmed.contains("/"),
-              !trimmed.contains("\\") else {
+              !trimmed.contains("\\"),
+              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
             throw AppError("自定义归档名称无效，不能包含路径分隔符。")
         }
 
@@ -205,7 +445,56 @@ enum AerialService {
         guard !stem.isEmpty, stem != ".", stem != ".." else {
             throw AppError("自定义归档名称无效。")
         }
-        return "\(stem).mov"
+        return stem
+    }
+
+    private static func uuidFromArchiveFilename(_ url: URL) -> String? {
+        let stem = url.deletingPathExtension().lastPathComponent
+        guard let separator = stem.firstIndex(of: "-") else { return nil }
+        let candidate = String(stem[stem.index(after: separator)...])
+        return normalizeUUID(candidate)
+    }
+
+    private static func loadArchiveMetadata() -> [String: WallpaperArchiveMetadata] {
+        guard let data = try? Data(contentsOf: AppPaths.archiveMetadataURL),
+              let metadata = try? JSONDecoder().decode(
+                  [String: WallpaperArchiveMetadata].self,
+                  from: data
+              ) else {
+            return [:]
+        }
+        return metadata
+    }
+
+    private static func saveArchiveMetadata(_ metadata: [String: WallpaperArchiveMetadata]) throws {
+        try AppPaths.ensureDirectory(AppPaths.archiveDirectory)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(metadata)
+        try data.write(to: AppPaths.archiveMetadataURL, options: [.atomic])
+    }
+
+    static func migrateLegacyDesktopArchives() {
+        guard FileManager.default.fileExists(atPath: AppPaths.legacyDesktopArchiveDirectory.path),
+              (try? AppPaths.ensureDirectory(AppPaths.archiveDirectory)) != nil else { return }
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: AppPaths.legacyDesktopArchiveDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for url in urls where url.pathExtension.lowercased() == "mov" {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            let destination = AppPaths.archiveDirectory.appendingPathComponent(url.lastPathComponent)
+            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
+            do {
+                try FileManager.default.copyItem(at: url, to: destination)
+                try verifyNonEmpty(destination)
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+            }
+        }
     }
 
     static func backups(for uuid: String) -> [BackupEntry] {
@@ -277,7 +566,7 @@ enum AerialService {
 
     private static func nextArchiveNumber() -> Int {
         let urls = (try? FileManager.default.contentsOfDirectory(
-            at: AppPaths.desktopArchiveDirectory,
+            at: AppPaths.archiveDirectory,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )) ?? []

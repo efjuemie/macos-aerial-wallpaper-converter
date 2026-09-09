@@ -6,20 +6,17 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                header
-                inputSection
-                targetSection
-                settingsSection
-                environmentSection
-                progressSection
-                backupSection
-                footer
-            }
-            .padding(28)
+        TabView {
+            newWallpaperTab
+                .tabItem {
+                    Label("新壁纸替换", systemImage: "wand.and.stars")
+                }
+            HistoryView(model: model)
+                .tabItem {
+                    Label("历史壁纸", systemImage: "clock.arrow.circlepath")
+                }
         }
-        .frame(minWidth: 760, minHeight: 700)
+        .frame(minWidth: 820, minHeight: 720)
         .background(Color(nsColor: .windowBackgroundColor))
         .alert("提示", isPresented: Binding(
             get: { model.alertMessage != nil },
@@ -37,7 +34,7 @@ struct ContentView: View {
             Button("继续处理", role: .destructive) { model.startProcessing() }
             Button("取消", role: .cancel) { }
         } message: {
-            Text("应用会先验证视频，再备份当前动态壁纸，最后替换系统壁纸文件。原文件会保留在桌面“壁纸”文件夹中。")
+            Text("应用会先验证视频，再备份当前动态壁纸，最后替换系统壁纸文件。原文件会保留在应用文件夹的“壁纸”目录中。")
         }
         .confirmationDialog(
             "确认恢复备份？",
@@ -48,6 +45,22 @@ struct ContentView: View {
             Button("取消", role: .cancel) { }
         } message: {
             Text("恢复前会自动备份当前文件，并重载 WallpaperAgent。")
+        }
+    }
+
+    private var newWallpaperTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                header
+                inputSection
+                targetSection
+                settingsSection
+                environmentSection
+                progressSection
+                backupSection
+                footer
+            }
+            .padding(28)
         }
     }
 
@@ -128,7 +141,7 @@ struct ContentView: View {
     }
 
     private var targetSection: some View {
-        SectionCard(title: "2 · 目标 Aerial", systemImage: "rectangle.on.rectangle") {
+        SectionCard(title: "2 · 目标动态壁纸", systemImage: "rectangle.on.rectangle") {
             HStack {
                 Text("已安装的动态壁纸")
                     .foregroundStyle(.secondary)
@@ -198,7 +211,7 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text("默认目标时长为 300 秒，使用 HEVC Main 10 和 temporal sample groups。")
+            Text("默认目标时长为 300 秒；输出会按主显示器比例补边，不拉伸原画面。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -281,12 +294,21 @@ struct ContentView: View {
             }
             if case .success = model.phase, let report = model.lastReport {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(report.isRestore ? "备份恢复成功：\(report.uuid)" : "替换成功：\(report.uuid)")
-                    if report.isRestore {
+                    Text(
+                        report.isArchiveReplacement
+                            ? "历史动态壁纸替换成功：\(report.uuid)"
+                            : report.isRestore
+                                ? "备份恢复成功：\(report.uuid)"
+                                : "替换成功：\(report.uuid)"
+                    )
+                    if report.isArchiveReplacement {
+                        Text("替换来源：\(report.outputURL.path)")
+                        Text("替换前备份：\(report.backupURL.path)")
+                    } else if report.isRestore {
                         Text("恢复前备份：\(report.backupURL.path)")
                         Text("恢复来源：\(report.outputURL.path)")
                     } else {
-                        Text("桌面归档：\(report.archiveURL.path)")
+                        Text("壁纸归档：\(report.archiveURL.path)")
                         Text("应用备份：\(report.backupURL.path)")
                         Text("处理输出：\(report.outputURL.path)")
                     }
@@ -302,7 +324,7 @@ struct ContentView: View {
                 HStack {
                     Button("打开系统设置→壁纸") { model.openWallpaperSettings() }
                         .buttonStyle(.borderedProminent)
-                    Button("打开桌面归档") { model.openArchiveFolder() }
+                    Button("打开壁纸归档") { model.openArchiveFolder() }
                         .buttonStyle(.bordered)
                 }
                 Text("请重新点击对应动态壁纸，并连续测试 5 次锁屏→解锁。桌面保持静态是正常的；黑屏或第二次不播放则应恢复备份。")
@@ -345,7 +367,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("WallpaperConverter · v0.3.0")
+            Text("WallpaperConverter · v0.4.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()

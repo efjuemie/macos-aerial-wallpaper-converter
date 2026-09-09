@@ -19,6 +19,13 @@ final class AppModel: ObservableObject {
     @Published var lastReport: OperationReport?
     @Published var backups: [BackupEntry] = []
     @Published var selectedBackup: BackupEntry?
+    @Published var archiveEntries: [WallpaperArchiveEntry] = []
+    @Published var selectedArchive: WallpaperArchiveEntry?
+    @Published var archiveRenameText = ""
+    @Published var isGeneratingPreviews = false
+    @Published var archiveToDelete: WallpaperArchiveEntry?
+    @Published var showArchiveDeleteConfirmation = false
+    @Published var showArchiveReplaceConfirmation = false
     @Published var showProcessConfirmation = false
     @Published var showRestoreConfirmation = false
     @Published var alertMessage: String?
@@ -27,6 +34,7 @@ final class AppModel: ObservableObject {
     @Published var archiveNameText = ""
 
     private let logger = AppLogger()
+    private var previewTask: Task<Void, Never>?
 
     init() {
         refresh()
@@ -55,6 +63,38 @@ final class AppModel: ObservableObject {
             environmentChecks = await EnvironmentChecker.check()
             let status = await EnvironmentChecker.oldLaunchAgentStatus()
             oldAgentWarning = status.isRunning ? status.detail : nil
+        }
+        refreshArchives()
+    }
+
+    func refreshArchives() {
+        previewTask?.cancel()
+        isGeneratingPreviews = true
+        previewTask = Task { @MainActor [weak self] in
+            await Task.detached(priority: .utility) {
+                AerialService.migrateLegacyDesktopArchives()
+            }.value
+            guard let self, !Task.isCancelled else { return }
+            let entries = AerialService.archiveEntries()
+            self.archiveEntries = entries
+            if let selectedArchive = self.selectedArchive {
+                self.selectedArchive = entries.first { $0.url == selectedArchive.url }
+            }
+            guard !entries.isEmpty else {
+                self.isGeneratingPreviews = false
+                return
+            }
+            for entry in entries {
+                guard !Task.isCancelled else { return }
+                guard !FileManager.default.fileExists(atPath: entry.previewURL.path) else { continue }
+                try? await PreviewService.generateFirstFrame(from: entry.url, to: entry.previewURL)
+            }
+            guard !Task.isCancelled else { return }
+            self.archiveEntries = AerialService.archiveEntries()
+            if let selectedArchive = self.selectedArchive {
+                self.selectedArchive = self.archiveEntries.first { $0.url == selectedArchive.url }
+            }
+            self.isGeneratingPreviews = false
         }
     }
 
@@ -149,8 +189,16 @@ final class AppModel: ObservableObject {
             return
         }
         let loopCount = max(1, Int(ceil(targetDuration / inputInfo.duration)))
+        let canvasSize = aspectFitCanvasSize(for: inputInfo)
         showProcessConfirmation = false
-        runConversion(input: inputInfo, uuid: uuid, loopCount: loopCount, bitrate: bitrate, archiveName: archiveName.isEmpty ? nil : archiveName)
+        runConversion(
+            input: inputInfo,
+            uuid: uuid,
+            loopCount: loopCount,
+            bitrate: bitrate,
+            archiveName: archiveName.isEmpty ? nil : archiveName,
+            canvasSize: canvasSize
+        )
     }
 
     func openWallpaperSettings() {
@@ -159,8 +207,117 @@ final class AppModel: ObservableObject {
     }
 
     func openArchiveFolder() {
-        try? AppPaths.ensureDirectory(AppPaths.desktopArchiveDirectory)
-        NSWorkspace.shared.open(AppPaths.desktopArchiveDirectory)
+        do {
+            try AppPaths.ensureDirectory(AppPaths.archiveDirectory)
+            try AppPaths.ensureDirectory(AppPaths.previewDirectory)
+            NSWorkspace.shared.open(AppPaths.archiveDirectory)
+        } catch {
+            alertMessage = "无法打开壁纸归档文件夹：\(error.localizedDescription)"
+        }
+    }
+
+    func selectArchive(_ entry: WallpaperArchiveEntry) {
+        selectedArchive = entry
+        archiveRenameText = entry.editableName
+    }
+
+    func renameSelectedArchive() {
+        guard let selectedArchive else { return }
+        do {
+            try AerialService.renameArchive(selectedArchive, to: archiveRenameText)
+            self.selectedArchive = nil
+            archiveRenameText = ""
+            refreshArchives()
+        } catch {
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    func requestDeleteArchive(_ entry: WallpaperArchiveEntry) {
+        archiveToDelete = entry
+        showArchiveDeleteConfirmation = true
+    }
+
+    func deleteArchive() {
+        guard let archiveToDelete else { return }
+        showArchiveDeleteConfirmation = false
+        do {
+            try AerialService.deleteArchive(archiveToDelete)
+            if selectedArchive?.url == archiveToDelete.url {
+                selectedArchive = nil
+                archiveRenameText = ""
+            }
+            self.archiveToDelete = nil
+            refreshArchives()
+        } catch {
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    func openArchiveVideo(_ entry: WallpaperArchiveEntry) {
+        NSWorkspace.shared.open(entry.url)
+    }
+
+    func revealArchive(_ entry: WallpaperArchiveEntry) {
+        NSWorkspace.shared.activateFileViewerSelecting([entry.url])
+    }
+
+    func requestArchiveReplacement() {
+        guard selectedArchive?.uuid != nil else {
+            alertMessage = "该历史归档缺少目标 UUID，无法自动替换。"
+            return
+        }
+        showArchiveReplaceConfirmation = true
+    }
+
+    func quickReplaceSelectedArchive() {
+        guard let archive = selectedArchive,
+              let uuid = archive.uuid else {
+            alertMessage = "请选择包含目标 UUID 的历史壁纸。"
+            return
+        }
+        showArchiveReplaceConfirmation = false
+        isProcessing = true
+        phase = .running(number: 1, title: "替换历史动态壁纸", detail: "正在备份当前动态壁纸并安装历史版本…")
+        lastReport = nil
+
+        Task {
+            do {
+                let target = try AerialService.targetURL(uuid: uuid)
+                guard FileManager.default.isReadableFile(atPath: target.path) else {
+                    throw AppError("目标动态壁纸不存在：\(target.path)")
+                }
+                let currentBackup = try AerialService.createBackup(of: target, uuid: uuid, suffix: "before-history-restore")
+                let sourceHash = try AerialService.sha256(archive.url)
+                do {
+                    try AerialService.replaceAtomically(source: archive.url, target: target)
+                    guard sourceHash == (try AerialService.sha256(target)) else {
+                        throw AppError("安装后的历史壁纸校验失败。")
+                    }
+                } catch {
+                    try? AerialService.replaceAtomically(source: currentBackup, target: target)
+                    throw error
+                }
+                let warning = await reloadWallpaperAgent()
+                backups = AerialService.backups(for: uuid)
+                lastReport = OperationReport(
+                    uuid: uuid,
+                    archiveURL: archive.url,
+                    backupURL: currentBackup,
+                    outputURL: archive.url,
+                    reloadWarning: warning,
+                    isRestore: true,
+                    isArchiveReplacement: true
+                )
+                phase = .success
+                logger.write("History replacement uuid=\(uuid) archive=\(archive.url.path) backup=\(currentBackup.path)")
+            } catch {
+                phase = .failed(error.localizedDescription)
+                alertMessage = error.localizedDescription
+                logger.write("History replacement failure: \(error.localizedDescription)")
+            }
+            isProcessing = false
+        }
     }
 
     func openLog() {
@@ -232,7 +389,8 @@ final class AppModel: ObservableObject {
                     backupURL: currentBackup,
                     outputURL: backup.url,
                     reloadWarning: warning,
-                    isRestore: true
+                    isRestore: true,
+                    isArchiveReplacement: false
                 )
                 phase = .success
                 logger.write("Restored backup=\(backup.url.path) target=\(target.path)")
@@ -244,10 +402,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func runConversion(input: InputVideoInfo, uuid: String, loopCount: Int, bitrate: Int, archiveName: String?) {
+    private func runConversion(
+        input: InputVideoInfo,
+        uuid: String,
+        loopCount: Int,
+        bitrate: Int,
+        archiveName: String?,
+        canvasSize: VideoCanvasSize?
+    ) {
         isProcessing = true
         progress = 0
-        phase = .running(number: 1, title: "检查开发环境", detail: "正在检查 Swift、Git、Python 3 和 Aerial 目录…")
+        phase = .running(number: 1, title: "检查开发环境", detail: "正在检查 Swift、Git、Python 3 和动态壁纸目录…")
         lastReport = nil
 
         Task {
@@ -267,14 +432,16 @@ final class AppModel: ObservableObject {
                 logger.write("Start input=\(input.url.path) uuid=\(uuid) duration=\(input.duration) loopCount=\(loopCount) bitrate=\(bitrate)")
                 progress = 3
 
-                phase = .running(number: 4, title: "编码 Aerial 兼容视频", detail: "正在生成 HEVC Main 10 输出，预计需要一些时间…")
+                let aspectDetail = canvasSize == nil ? "保持原始画幅比例。" : "按主显示器比例补边，不拉伸原画面。"
+                phase = .running(number: 4, title: "编码动态壁纸视频", detail: "正在生成 HEVC Main 10 输出，\(aspectDetail)")
                 let output = try processedOutputURL(uuid: uuid)
                 try await EncoderService.encode(
                     input: input.url,
                     output: output,
                     loopCount: loopCount,
                     bitrateMbps: bitrate,
-                    executable: encoder
+                    executable: encoder,
+                    canvasSize: canvasSize
                 )
                 progress = 4
 
@@ -291,9 +458,17 @@ final class AppModel: ObservableObject {
                     throw AppError("目标动态壁纸不存在：\(target.path)\n请先在系统设置→壁纸中下载并应用对应动态壁纸。")
                 }
 
-                phase = .running(number: 6, title: "备份原 Aerial", detail: "正在备份到应用备份目录和桌面“壁纸”文件夹…")
+                phase = .running(number: 6, title: "归档原动态壁纸", detail: "正在保存到应用文件夹中的“壁纸”目录…")
                 let backup = try AerialService.createBackup(of: target, uuid: uuid)
-                let archive = try AerialService.archiveOriginalOnDesktop(of: target, customName: archiveName)
+                let archive = try AerialService.archiveOriginal(of: target, uuid: uuid, customName: archiveName)
+                do {
+                    try await PreviewService.generateFirstFrame(
+                        from: archive,
+                        to: AerialService.previewURL(for: archive)
+                    )
+                } catch {
+                    logger.write("Preview generation failed archive=\(archive.path): \(error.localizedDescription)")
+                }
                 progress = 6
 
                 phase = .running(number: 7, title: "安装新视频", detail: "正在校验并安全替换目标文件…")
@@ -318,11 +493,13 @@ final class AppModel: ObservableObject {
                     backupURL: backup,
                     outputURL: output,
                     reloadWarning: reloadWarning,
-                    isRestore: false
+                    isRestore: false,
+                    isArchiveReplacement: false
                 )
                 phase = .success
                 backups = AerialService.backups(for: uuid)
                 targets = AerialService.targets()
+                refreshArchives()
                 logger.write("Success uuid=\(uuid) archive=\(archive.path) backup=\(backup.path) output=\(output.path) reloadWarning=\(reloadWarning ?? "none")")
             } catch {
                 phase = .failed(error.localizedDescription)
@@ -339,6 +516,38 @@ final class AppModel: ObservableObject {
         guard freeBytes >= 1_500_000_000 else {
             throw AppError("可用磁盘空间不足 1.5 GB，已停止处理。")
         }
+    }
+
+    private func aspectFitCanvasSize(for input: InputVideoInfo) -> VideoCanvasSize? {
+        guard let screenSize = NSScreen.main?.frame.size,
+              screenSize.width > 0,
+              screenSize.height > 0 else {
+            return nil
+        }
+        let sourceAspect = Double(input.width) / Double(input.height)
+        let screenAspect = screenSize.width / screenSize.height
+        guard abs(sourceAspect - screenAspect) > 0.005 else { return nil }
+
+        var width: Double
+        var height: Double
+        if sourceAspect < screenAspect {
+            height = Double(input.height)
+            width = height * screenAspect
+        } else {
+            width = Double(input.width)
+            height = width / screenAspect
+        }
+
+        let maximumDimension = 3840.0
+        if max(width, height) > maximumDimension {
+            let scale = maximumDimension / max(width, height)
+            width *= scale
+            height *= scale
+        }
+
+        let evenWidth = max(2, Int(width.rounded()) & ~1)
+        let evenHeight = max(2, Int(height.rounded()) & ~1)
+        return VideoCanvasSize(width: evenWidth, height: evenHeight)
     }
 
     private func processedOutputURL(uuid: String) throws -> URL {
