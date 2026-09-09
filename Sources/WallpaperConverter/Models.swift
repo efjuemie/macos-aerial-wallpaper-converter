@@ -68,7 +68,7 @@ enum ProcessingPhase: Equatable {
         switch self {
         case .idle: return "拖入一个视频开始。"
         case let .running(_, _, detail): return detail
-        case .success: return "请在系统设置中重新选择对应的航拍壁纸。"
+        case .success: return "请在系统设置中重新选择对应的动态壁纸。"
         case let .failed(message): return message
         }
     }

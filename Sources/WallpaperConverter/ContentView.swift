@@ -37,7 +37,7 @@ struct ContentView: View {
             Button("继续处理", role: .destructive) { model.startProcessing() }
             Button("取消", role: .cancel) { }
         } message: {
-            Text("应用会先验证视频，再备份当前 Aerial，最后替换系统壁纸文件。原文件会保留在桌面“壁纸”文件夹中。")
+            Text("应用会先验证视频，再备份当前动态壁纸，最后替换系统壁纸文件。原文件会保留在桌面“壁纸”文件夹中。")
         }
         .confirmationDialog(
             "确认恢复备份？",
@@ -57,7 +57,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Aerial Wallpaper Converter")
                     .font(.system(size: 26, weight: .bold, design: .rounded))
-                Text("将视频转换为更稳定的 macOS 动态航拍壁纸")
+                Text("将视频转换为更稳定的 macOS 动态壁纸")
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -92,11 +92,23 @@ struct ContentView: View {
             }
             .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
                 guard let provider = providers.first else { return false }
-                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    var url: URL?
+                    if let itemURL = item as? URL {
+                        url = itemURL
+                    } else if let data = item as? Data {
+                        url = URL(dataRepresentation: data, relativeTo: nil)
+                    }
                     guard let url else { return }
                     DispatchQueue.main.async { model.loadVideo(at: url) }
                 }
                 return true
+            }
+
+            if model.isInspectingVideo {
+                Label("正在读取视频信息…", systemImage: "hourglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if let info = model.inputInfo {
@@ -118,9 +130,9 @@ struct ContentView: View {
     private var targetSection: some View {
         SectionCard(title: "2 · 目标 Aerial", systemImage: "rectangle.on.rectangle") {
             HStack {
-                Text("已安装的航拍壁纸")
+                Text("已安装的动态壁纸")
                     .foregroundStyle(.secondary)
-                Picker("已安装的航拍壁纸", selection: $model.selectedUUID) {
+                Picker("已安装的动态壁纸", selection: $model.selectedUUID) {
                     Text("手动输入 UUID").tag("")
                     ForEach(model.targets) { target in
                         Text(target.uuid).tag(target.uuid)
@@ -131,6 +143,19 @@ struct ContentView: View {
                     model.selectTarget(value)
                 }
                 Spacer()
+            }
+
+            HStack {
+                Text("目标文件夹")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 110, alignment: .leading)
+                Button("打开动态壁纸文件夹", systemImage: "folder") {
+                    model.openDynamicWallpaperFolder()
+                }
+                .buttonStyle(.bordered)
+                Text("快速定位系统动态壁纸文件")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             HStack {
@@ -147,7 +172,7 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text("默认目标：\(AppModel.defaultUUID)。如果不存在，请先在系统设置→壁纸中下载并应用对应航拍壁纸。")
+            Text("默认目标：\(AppModel.defaultUUID)。如果不存在，请先在系统设置→壁纸中下载并应用对应动态壁纸。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -162,6 +187,16 @@ struct ContentView: View {
                     InfoCell(label: "预计循环", value: "\(max(1, Int(ceil(seconds / info.duration)))) 次")
                 }
                 Spacer()
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("归档名称（可选）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("例如：我的夜景", text: $model.archiveNameText)
+                    .textFieldStyle(.roundedBorder)
+                Text("留空使用原 UUID；填写后仍会保留自动编号，例如 1-我的夜景.mov。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Text("默认目标时长为 300 秒，使用 HEVC Main 10 和 temporal sample groups。")
                 .font(.caption)
@@ -270,7 +305,7 @@ struct ContentView: View {
                     Button("打开桌面归档") { model.openArchiveFolder() }
                         .buttonStyle(.bordered)
                 }
-                Text("请重新点击对应航拍壁纸，并连续测试 5 次锁屏→解锁。桌面保持静态是正常的；黑屏或第二次不播放则应恢复备份。")
+                Text("请重新点击对应动态壁纸，并连续测试 5 次锁屏→解锁。桌面保持静态是正常的；黑屏或第二次不播放则应恢复备份。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -310,7 +345,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("WallpaperConverter · v0.2.0")
+            Text("WallpaperConverter · v0.3.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()

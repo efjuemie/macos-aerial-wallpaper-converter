@@ -176,7 +176,7 @@ enum EnvironmentChecker {
         checks.append(EnvironmentCheck(
             name: "Aerial 目录",
             isOK: aerialAccessible,
-            detail: aerialAccessible ? AppPaths.aerialDirectory.path : "目录不存在，请先在系统设置中下载并应用航拍壁纸"
+            detail: aerialAccessible ? AppPaths.aerialDirectory.path : "目录不存在，请先在系统设置中下载并应用动态壁纸"
         ))
         return checks
     }

@@ -175,15 +175,37 @@ enum AerialService {
         return destination
     }
 
-    static func archiveOriginalOnDesktop(of target: URL) throws -> URL {
+    static func archiveOriginalOnDesktop(of target: URL, customName: String? = nil) throws -> URL {
         try AppPaths.ensureDirectory(AppPaths.desktopArchiveDirectory)
         let number = nextArchiveNumber()
+        let filename = try archiveFilename(for: target, customName: customName)
         let destination = AppPaths.desktopArchiveDirectory.appendingPathComponent(
-            "\(number)-\(target.lastPathComponent)"
+            "\(number)-\(filename)"
         )
         try FileManager.default.copyItem(at: target, to: destination)
         try verifyNonEmpty(destination)
         return destination
+    }
+
+    private static func archiveFilename(for target: URL, customName: String?) throws -> String {
+        guard let customName else { return target.lastPathComponent }
+        let trimmed = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed != ".",
+              trimmed != "..",
+              !trimmed.contains("/"),
+              !trimmed.contains("\\") else {
+            throw AppError("自定义归档名称无效，不能包含路径分隔符。")
+        }
+
+        var stem = trimmed
+        if stem.lowercased().hasSuffix(".mov") {
+            stem.removeLast(4)
+        }
+        guard !stem.isEmpty, stem != ".", stem != ".." else {
+            throw AppError("自定义归档名称无效。")
+        }
+        return "\(stem).mov"
     }
 
     static func backups(for uuid: String) -> [BackupEntry] {

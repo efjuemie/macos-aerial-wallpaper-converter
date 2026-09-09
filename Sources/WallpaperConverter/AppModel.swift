@@ -23,6 +23,8 @@ final class AppModel: ObservableObject {
     @Published var showRestoreConfirmation = false
     @Published var alertMessage: String?
     @Published var isProcessing = false
+    @Published var isInspectingVideo = false
+    @Published var archiveNameText = ""
 
     private let logger = AppLogger()
 
@@ -38,7 +40,7 @@ final class AppModel: ObservableObject {
     }
 
     var canStart: Bool {
-        inputInfo != nil && AerialService.normalizeUUID(uuidText) != nil && !isProcessing
+        inputInfo != nil && AerialService.normalizeUUID(uuidText) != nil && !isProcessing && !isInspectingVideo
     }
 
     var selectedTargetExists: Bool {
@@ -79,13 +81,14 @@ final class AppModel: ObservableObject {
         inputPath = url.path
         inputInfo = nil
         alertMessage = nil
+        isInspectingVideo = true
 
-        Task {
+        Task { @MainActor in
             do {
-                let info = try await Task.detached(priority: .userInitiated) {
-                    try await VideoInspector.inspect(url)
-                }.value
+                let info = try await VideoInspector.inspect(url)
+                guard !Task.isCancelled else { return }
                 inputInfo = info
+                isInspectingVideo = false
                 if let detectedUUID = AerialService.uuidFromFilename(url) {
                     uuidText = detectedUUID
                     selectedUUID = detectedUUID
@@ -93,8 +96,18 @@ final class AppModel: ObservableObject {
                 }
                 logger.write("Loaded input=\(url.path) duration=\(info.duration) size=\(info.width)x\(info.height)")
             } catch {
+                isInspectingVideo = false
                 alertMessage = error.localizedDescription
             }
+        }
+    }
+
+    func openDynamicWallpaperFolder() {
+        do {
+            try AppPaths.ensureDirectory(AppPaths.aerialDirectory)
+            NSWorkspace.shared.open(AppPaths.aerialDirectory)
+        } catch {
+            alertMessage = "无法打开动态壁纸文件夹：\(error.localizedDescription)"
         }
     }
 
@@ -130,9 +143,14 @@ final class AppModel: ObservableObject {
             alertMessage = "目标时长不能超过 3600 秒。"
             return
         }
+        let archiveName = archiveNameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !archiveName.contains("/") && !archiveName.contains("\\") else {
+            alertMessage = "自定义归档名称不能包含路径分隔符。"
+            return
+        }
         let loopCount = max(1, Int(ceil(targetDuration / inputInfo.duration)))
         showProcessConfirmation = false
-        runConversion(input: inputInfo, uuid: uuid, loopCount: loopCount, bitrate: bitrate)
+        runConversion(input: inputInfo, uuid: uuid, loopCount: loopCount, bitrate: bitrate, archiveName: archiveName.isEmpty ? nil : archiveName)
     }
 
     func openWallpaperSettings() {
@@ -226,7 +244,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func runConversion(input: InputVideoInfo, uuid: String, loopCount: Int, bitrate: Int) {
+    private func runConversion(input: InputVideoInfo, uuid: String, loopCount: Int, bitrate: Int, archiveName: String?) {
         isProcessing = true
         progress = 0
         phase = .running(number: 1, title: "检查开发环境", detail: "正在检查 Swift、Git、Python 3 和 Aerial 目录…")
@@ -270,12 +288,12 @@ final class AppModel: ObservableObject {
 
                 let target = try AerialService.targetURL(uuid: uuid)
                 guard FileManager.default.isReadableFile(atPath: target.path) else {
-                    throw AppError("目标 Aerial 不存在：\(target.path)\n请先在系统设置→壁纸中下载并应用对应航拍壁纸。")
+                    throw AppError("目标动态壁纸不存在：\(target.path)\n请先在系统设置→壁纸中下载并应用对应动态壁纸。")
                 }
 
                 phase = .running(number: 6, title: "备份原 Aerial", detail: "正在备份到应用备份目录和桌面“壁纸”文件夹…")
                 let backup = try AerialService.createBackup(of: target, uuid: uuid)
-                let archive = try AerialService.archiveOriginalOnDesktop(of: target)
+                let archive = try AerialService.archiveOriginalOnDesktop(of: target, customName: archiveName)
                 progress = 6
 
                 phase = .running(number: 7, title: "安装新视频", detail: "正在校验并安全替换目标文件…")
