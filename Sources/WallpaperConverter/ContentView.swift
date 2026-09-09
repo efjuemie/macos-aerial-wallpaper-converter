@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import AppKit
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
@@ -52,6 +53,7 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(alignment: .top) {
+            AppLogoView()
             VStack(alignment: .leading, spacing: 6) {
                 Text("Aerial Wallpaper Converter")
                     .font(.system(size: 26, weight: .bold, design: .rounded))
@@ -308,7 +310,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("WallpaperConverter · v0.1.0")
+            Text("WallpaperConverter · v0.2.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()
@@ -316,6 +318,28 @@ struct ContentView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
+    }
+}
+
+private struct AppLogoView: View {
+    var body: some View {
+        Group {
+            if let url = Bundle.main.url(forResource: "AppLogo", withExtension: "png"),
+               let image = NSImage(contentsOf: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "film.stack.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .padding(14)
+                    .foregroundStyle(Color.accentColor)
+            }
+        }
+        .frame(width: 62, height: 62)
+        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .shadow(color: .black.opacity(0.18), radius: 6, y: 3)
     }
 }
 

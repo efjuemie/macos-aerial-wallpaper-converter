@@ -15,6 +15,10 @@ enum AppPaths {
         "Encoder/macos-custom-video-wallpaper-fix",
         isDirectory: true
     )
+    static let bundledEncoderCache = appSupport.appendingPathComponent(
+        "Encoder/macos-custom-video-wallpaper-fix-bundled-v2",
+        isDirectory: true
+    )
     static let processedDirectory = appSupport.appendingPathComponent(
         "Processed",
         isDirectory: true
@@ -36,6 +40,27 @@ enum AppPaths {
     static let oldLaunchAgentDisabled = home.appendingPathComponent(
         "Library/LaunchAgents/com.local.wallpaper-aerial-fix.plist.disabled"
     )
+
+    static var bundledEncoderRepository: URL? {
+        let candidates = [
+            Bundle.main.resourceURL?.appendingPathComponent(
+                "Encoder/macos-custom-video-wallpaper-fix",
+                isDirectory: true
+            ),
+            URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    "ThirdParty/macos-custom-video-wallpaper-fix",
+                    isDirectory: true
+                )
+        ].compactMap { $0 }
+
+        return candidates.first {
+            fileManager.fileExists(atPath: $0.appendingPathComponent("encode_temporal.swift").path)
+        }
+    }
 
     static func ensureDirectory(_ url: URL) throws {
         try fileManager.createDirectory(at: url, withIntermediateDirectories: true)

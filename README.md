@@ -2,7 +2,7 @@
 
 一个原生 SwiftUI macOS 应用，将短视频转换成带有 HEVC temporal sample groups 的 Aerial 兼容视频，并安全替换当前用户的 macOS 航拍动态壁纸文件。
 
-当前版本：**0.1.0**
+当前版本：**0.2.0**
 
 ## 功能
 
@@ -15,6 +15,7 @@
 - 使用 SHA-256 校验和临时文件原子替换，失败时不安装；安装失败会尝试恢复备份。
 - 支持恢复历史备份、打开日志、检查旧的自动 LaunchAgent。
 - 不常驻后台，不使用 `killall WallpaperAerialsExtension`，不需要 root 或关闭 SIP。
+- 编码器源文件随应用打包，正常使用无需连接 GitHub；应用内置简约 Logo 和 macOS AppIcon。
 
 ## 系统要求
 
@@ -23,13 +24,44 @@
 - Git 和 Python 3（Python 3 仅用于 `groups.py` 验证）。
 - 目标航拍壁纸必须已经在“系统设置 → 壁纸”中下载并应用过，目标 `.mov` 才会存在。
 
-首次点击“处理并替换”时，应用会将上游编码器仓库缓存到：
+首次点击“处理并替换”时，应用会优先使用随应用打包的编码器源文件，并缓存编译结果到：
 
 ```text
-~/Library/Application Support/WallpaperConverter/Encoder/macos-custom-video-wallpaper-fix
+~/Library/Application Support/WallpaperConverter/Encoder/macos-custom-video-wallpaper-fix-bundled-v2
 ```
 
-应用不会删除已有编码器目录，也不会自动执行 `git pull`。上游项目接口和原理见 [macos-custom-video-wallpaper-fix](https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix)。该项目采用 MIT License。
+因此，即使 GitHub 无法连接，已打包的应用仍可准备并编译编码器。只有在应用资源缺失时，才会使用网络下载作为后备路径。应用不会删除已有的旧编码器目录，也不会自动执行 `git pull`。上游项目接口和原理见 [macos-custom-video-wallpaper-fix](https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix)，对应源文件和 MIT License 位于本仓库的 `ThirdParty/` 目录。
+
+## 从 Wallpaper Engine 获取并准备壁纸
+
+macOS 版 Wallpaper Engine 目前不能直接运行，因此通常需要在 Windows 环境中导出视频；也可以使用其他支持导出视频的壁纸网站或应用。
+
+以 Steam 版 Wallpaper Engine 为例：
+
+1. 订阅一个壁纸。
+2. 右键壁纸，选择“发送至移动设备”。
+3. 在移动设备页面点击“导出 `.mpkg` 文件”。
+4. 在弹窗中选择“预渲染：高性能”。
+5. 视频裁剪选择“保持原始宽高比”。
+6. 帧率选择 `60`，然后导出。
+
+如果导出的壁纸包含场景或是 `.pkg` / `.mpkg` 格式，可以使用 Windows 版 `RePKG-GUI_v1.0.1` 将其提取为 `.mp4`。该工具疑似不支持 macOS，请在 Windows 电脑或 Windows 虚拟机中完成这一步；不要在 macOS 上直接运行 ZIP 中的 `.exe` 文件。操作参考：[1分钟教会你提取 Wallpaper Engine 动态壁纸 pkg 格式 RePKG-GUI 软件使用教程](https://www.bilibili.com/video/BV1fKkuBtEtQ/?share_source=copy_web&vd_source=bd22f6255144a26beb7e590998543f34)。
+
+得到 `.mp4` 后，可以使用其他视频工具转换为 `.mov`。一个在线参考工具是 [SubHero 视频转换器](https://subhero.io/zh-Hans/tools/video-converter)。上传私人或敏感视频到第三方网站前，请先确认其隐私政策；也可以使用本地视频转换工具。
+
+## 壁纸处理全流程
+
+1. 准备一个 `.mov` 文件。应用也接受 `.mp4` 和 `.m4v`，会统一交给内置编码器处理。
+2. 打开应用，将视频拖入窗口，或点击“选择文件”，也可以在路径输入框中粘贴完整路径。
+3. 确认目标 Aerial UUID。默认目标为 `00BA71CD-2C54-415A-A68A-8358E677D750`；也可以从当前 Aerial 目录选择其他已安装壁纸或手动输入 UUID。
+4. 确认目标时长和码率。默认目标时长为 300 秒，码率为 12 Mbps，应用会根据原视频时长自动计算循环次数。
+5. 点击“处理并替换”并确认。应用会检查开发环境和磁盘空间，使用 HEVC Main 10 编码，然后验证 `sgpd/csgm` 中的 `tscl` 与 `tsas` 四项标记。
+6. 验证通过后，应用确认目标文件存在，备份原 Aerial，并将原文件复制到桌面 `壁纸` 文件夹，按 `1-UUID.mov`、`2-UUID.mov` 的顺序编号。
+7. 新视频会先复制到目标目录中的临时文件，完成 SHA-256 校验后再原子替换目标文件；安装后的文件会再次校验。
+8. 应用只重载一次 `WallpaperAgent`。完成后打开“系统设置 → 壁纸”，重新点击对应航拍壁纸。
+9. 使用 `Control + Command + Q` 锁屏，连续测试至少 5 次“锁屏 → 解锁”。桌面保持静态是正常的；黑屏、冻结或第二次不播放时，请在应用中恢复备份。
+
+应用不会通过常驻脚本在每次解锁后杀掉壁纸进程，也不会修改系统保护目录。
 
 ## 构建
 

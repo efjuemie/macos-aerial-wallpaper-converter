@@ -261,7 +261,10 @@ final class AppModel: ObservableObject {
                 progress = 4
 
                 phase = .running(number: 5, title: "验证 temporal sample groups", detail: "必须同时包含 tscl 和 tsas 的四项标记。")
-                let validation = try await EncoderService.validate(output: output, repository: AppPaths.encoderRepository)
+                let validation = try await EncoderService.validate(
+                    output: output,
+                    repository: encoder.deletingLastPathComponent()
+                )
                 logger.write("Validation output=\(validation.replacingOccurrences(of: "\n", with: " | "))")
                 progress = 5
 

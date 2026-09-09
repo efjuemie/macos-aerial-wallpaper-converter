@@ -5,6 +5,46 @@ enum EncoderService {
     static let repositoryURL = "https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix.git"
 
     static func prepare() async throws -> URL {
+        if let bundledRepository = AppPaths.bundledEncoderRepository {
+            return try await prepareBundled(repository: bundledRepository)
+        }
+        return try await prepareFromNetwork()
+    }
+
+    private static func prepareBundled(repository: URL) async throws -> URL {
+        let fileManager = FileManager.default
+        try AppPaths.ensureDirectory(AppPaths.bundledEncoderCache)
+        for filename in ["encode_temporal.swift", "groups.py", "build.sh", "LICENSE"] {
+            let source = repository.appendingPathComponent(filename)
+            let destination = AppPaths.bundledEncoderCache.appendingPathComponent(filename)
+            guard fileManager.fileExists(atPath: source.path) else { continue }
+            if !fileManager.fileExists(atPath: destination.path) {
+                try fileManager.copyItem(at: source, to: destination)
+            }
+        }
+
+        let executable = AppPaths.bundledEncoderCache.appendingPathComponent("encode_temporal")
+        if !fileManager.isExecutableFile(atPath: executable.path) {
+            let buildScript = AppPaths.bundledEncoderCache.appendingPathComponent("build.sh")
+            guard fileManager.fileExists(atPath: buildScript.path) else {
+                throw AppError("应用内置编码器缺少 build.sh，无法继续。")
+            }
+            let result = try await CommandRunner.run(
+                URL(fileURLWithPath: "/bin/bash"),
+                arguments: [buildScript.path],
+                currentDirectory: AppPaths.bundledEncoderCache
+            )
+            guard result.status == 0 else {
+                throw AppError("内置编码器编译失败：\n\(result.output)")
+            }
+        }
+        guard fileManager.isExecutableFile(atPath: executable.path) else {
+            throw AppError("内置编码器编译完成后没有生成 encode_temporal。")
+        }
+        return executable
+    }
+
+    private static func prepareFromNetwork() async throws -> URL {
         let fileManager = FileManager.default
         try AppPaths.ensureDirectory(AppPaths.encoderRepository.deletingLastPathComponent())
 
@@ -17,7 +57,7 @@ enum EncoderService {
                 arguments: ["clone", repositoryURL, AppPaths.encoderRepository.path]
             )
             guard result.status == 0 else {
-                throw AppError("编码器仓库下载失败：\n\(result.output)")
+                throw AppError("应用内置编码器不可用，且在线备用下载失败：\n\(result.output)")
             }
         }
 
