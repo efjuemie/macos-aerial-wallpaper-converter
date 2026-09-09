@@ -38,6 +38,10 @@ enum AppPaths {
         "预览",
         isDirectory: true
     )
+    static let encodedArchiveDirectory = archiveDirectory.appendingPathComponent(
+        "已编码",
+        isDirectory: true
+    )
     static let archiveMetadataURL = archiveDirectory.appendingPathComponent("metadata.json")
     static let legacyDesktopArchiveDirectory = home.appendingPathComponent(
         "Desktop/壁纸",

@@ -313,7 +313,7 @@ struct ContentView: View {
                     } else {
                         Text("壁纸归档：\(report.archiveURL.path)")
                         Text("应用备份：\(report.backupURL.path)")
-                        Text("处理输出：\(report.outputURL.path)")
+                        Text("新壁纸归档/处理输出：\(report.outputURL.path)")
                     }
                     if let warning = report.reloadWarning {
                         Text(warning)
@@ -370,7 +370,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("WallpaperConverter · v0.5.0")
+            Text("WallpaperConverter · v0.6.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()

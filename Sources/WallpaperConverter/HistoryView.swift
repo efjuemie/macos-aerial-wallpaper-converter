@@ -60,6 +60,10 @@ struct HistoryView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .textSelection(.enabled)
+                Text("已编码壁纸：\(AppPaths.encodedArchiveDirectory.path)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
             }
             Spacer()
             Button {
@@ -85,7 +89,7 @@ struct HistoryView: View {
                 .foregroundStyle(Color.accentColor)
             Text("还没有历史动态壁纸")
                 .font(.headline)
-            Text("完成一次新壁纸替换后，原视频和首帧预览会自动保存在应用的“壁纸”文件夹中。")
+            Text("完成一次新壁纸替换后，原视频和新编码视频都会保存在应用的“壁纸”文件夹中。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -131,8 +135,27 @@ struct HistoryView: View {
                     .frame(width: 420, height: 236)
 
                 VStack(alignment: .leading, spacing: 9) {
-                    Text(entry.displayName)
-                        .font(.headline)
+                    HStack(spacing: 8) {
+                        Text(entry.displayName)
+                            .font(.headline)
+                        Text(entry.kindLabel)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(
+                                entry.kind == .encoded
+                                    ? Color.accentColor.opacity(0.13)
+                                    : Color.primary.opacity(0.08),
+                                in: Capsule()
+                            )
+                    }
+                    Text(
+                        entry.kind == .encoded
+                            ? "这是应用编码并安装过的新壁纸，回退原壁纸后仍可再次使用。"
+                            : "这是替换前自动保存的原动态壁纸。"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     if let uuid = entry.uuid {
                         Text("目标 UUID：\(uuid)")
                             .font(.caption)
@@ -197,8 +220,17 @@ private struct ArchiveThumbnailCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ArchivePreviewImage(entry: entry)
-                .frame(height: 96)
+            ZStack(alignment: .topTrailing) {
+                ArchivePreviewImage(entry: entry)
+                    .frame(height: 96)
+                Text(entry.kindLabel)
+                    .font(.caption2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.black.opacity(0.58), in: Capsule())
+                    .foregroundStyle(.white)
+                    .padding(7)
+            }
             Text(entry.displayName)
                 .font(.caption)
                 .fontWeight(isSelected ? .semibold : .regular)

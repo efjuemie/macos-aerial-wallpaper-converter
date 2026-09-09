@@ -176,6 +176,8 @@ enum VideoAspectService {
               crop.sourceHeight <= sourceHeight + 1,
               crop.cropWidth > 1,
               crop.cropHeight > 1,
+              crop.outputWidth > 1,
+              crop.outputHeight > 1,
               crop.originX >= 0,
               crop.originY >= 0,
               crop.originX + crop.cropWidth <= sourceWidth + 1,
@@ -191,13 +193,21 @@ enum VideoAspectService {
             tx: preferredTransform.tx - transformedBounds.minX,
             ty: preferredTransform.ty - transformedBounds.minY
         )
+        let outputWidth = CGFloat(crop.outputWidth)
+        let outputHeight = CGFloat(crop.outputHeight)
+        let scale = max(
+            outputWidth / CGFloat(crop.cropWidth),
+            outputHeight / CGFloat(crop.cropHeight)
+        )
+        let overflowX = (outputWidth - CGFloat(crop.cropWidth) * scale) / 2
+        let overflowY = (outputHeight - CGFloat(crop.cropHeight) * scale) / 2
         let transform = CGAffineTransform(
-            a: normalizedTransform.a,
-            b: normalizedTransform.b,
-            c: normalizedTransform.c,
-            d: normalizedTransform.d,
-            tx: normalizedTransform.tx - crop.originX,
-            ty: normalizedTransform.ty - crop.originY
+            a: normalizedTransform.a * scale,
+            b: normalizedTransform.b * scale,
+            c: normalizedTransform.c * scale,
+            d: normalizedTransform.d * scale,
+            tx: normalizedTransform.tx * scale - CGFloat(crop.originX) * scale + overflowX,
+            ty: normalizedTransform.ty * scale - CGFloat(crop.originY) * scale + overflowY
         )
 
         let videoComposition = AVMutableVideoComposition()
@@ -331,7 +341,8 @@ enum AerialService {
             var metadata = loadArchiveMetadata()
             metadata[destination.lastPathComponent] = WallpaperArchiveMetadata(
                 uuid: normalizeUUID(uuid),
-                displayName: destination.deletingPathExtension().lastPathComponent
+                displayName: destination.deletingPathExtension().lastPathComponent,
+                kind: .original
             )
             try saveArchiveMetadata(metadata)
         } catch {
@@ -341,31 +352,78 @@ enum AerialService {
         return destination
     }
 
+    static func archiveEncodedOutput(_ output: URL, uuid: String) throws -> URL {
+        try AppPaths.ensureDirectory(AppPaths.archiveDirectory)
+        try AppPaths.ensureDirectory(AppPaths.previewDirectory)
+        try AppPaths.ensureDirectory(AppPaths.encodedArchiveDirectory)
+
+        let destination = uniqueURL(
+            directory: AppPaths.encodedArchiveDirectory,
+            filename: output.lastPathComponent
+        )
+        do {
+            try FileManager.default.moveItem(at: output, to: destination)
+            try verifyNonEmpty(destination)
+            var metadata = loadArchiveMetadata()
+            metadata[archiveMetadataKey(for: destination)] = WallpaperArchiveMetadata(
+                uuid: normalizeUUID(uuid),
+                displayName: destination.deletingPathExtension().lastPathComponent,
+                kind: .encoded
+            )
+            try saveArchiveMetadata(metadata)
+        } catch {
+            if FileManager.default.fileExists(atPath: destination.path),
+               !FileManager.default.fileExists(atPath: output.path) {
+                try? FileManager.default.moveItem(at: destination, to: output)
+            }
+            throw error
+        }
+        return destination
+    }
+
     static func archiveEntries() -> [WallpaperArchiveEntry] {
         let metadata = loadArchiveMetadata()
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: AppPaths.archiveDirectory,
-            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-
-        return urls.compactMap { url in
-            guard url.pathExtension.lowercased() == "mov",
-                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
-                return nil
+        let locations: [(directory: URL, kind: WallpaperArchiveKind)] = [
+            (AppPaths.archiveDirectory, .original),
+            (AppPaths.encodedArchiveDirectory, .encoded)
+        ]
+        let entries = locations.flatMap { location in
+            let urls = (try? FileManager.default.contentsOfDirectory(
+                at: location.directory,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            return urls.compactMap { url -> WallpaperArchiveEntry? in
+                guard url.pathExtension.lowercased() == "mov",
+                      (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                    return nil
+                }
+                let stem = url.deletingPathExtension().lastPathComponent
+                let record = metadata[archiveMetadataKey(for: url)] ?? metadata[url.lastPathComponent]
+                let kind = record?.kind ?? location.kind
+                let number = kind == .original
+                    ? stem.split(separator: "-", maxSplits: 1).first.flatMap { Int($0) } ?? 0
+                    : 0
+                let uuid = record?.uuid ?? (
+                    kind == .encoded
+                        ? uuidFromProcessedFilename(url)
+                        : uuidFromArchiveFilename(url)
+                )
+                return WallpaperArchiveEntry(
+                    url: url,
+                    previewURL: previewURL(for: url),
+                    number: number,
+                    uuid: uuid,
+                    displayName: record?.displayName ?? stem,
+                    kind: kind
+                )
             }
-            let stem = url.deletingPathExtension().lastPathComponent
-            let number = stem.split(separator: "-", maxSplits: 1).first.flatMap { Int($0) } ?? 0
-            let record = metadata[url.lastPathComponent]
-            return WallpaperArchiveEntry(
-                url: url,
-                previewURL: previewURL(for: url),
-                number: number,
-                uuid: record?.uuid ?? uuidFromArchiveFilename(url),
-                displayName: record?.displayName ?? stem
-            )
-        }.sorted {
-            if $0.number != $1.number { return $0.number > $1.number }
+        }
+        return entries.sorted {
+            if $0.kind != $1.kind { return $0.kind == .encoded }
+            if $0.kind == .original, $0.number != $1.number {
+                return $0.number > $1.number
+            }
             return $0.url.lastPathComponent > $1.url.lastPathComponent
         }
     }
@@ -378,16 +436,21 @@ enum AerialService {
 
     static func renameArchive(_ entry: WallpaperArchiveEntry, to name: String) throws {
         var stem = try normalizedArchiveStem(name)
-        let numberPrefix = "\(entry.number)-"
-        if stem.hasPrefix(numberPrefix) {
-            stem.removeFirst(numberPrefix.count)
+        if entry.kind == .original {
+            let numberPrefix = "\(entry.number)-"
+            if stem.hasPrefix(numberPrefix) {
+                stem.removeFirst(numberPrefix.count)
+            }
         }
         guard !stem.isEmpty else {
             throw AppError("自定义归档名称无效。")
         }
-        let destination = AppPaths.archiveDirectory.appendingPathComponent(
-            "\(entry.number)-\(stem).mov"
-        )
+        let destinationDirectory = entry.kind == .encoded
+            ? AppPaths.encodedArchiveDirectory
+            : AppPaths.archiveDirectory
+        let filename = entry.kind == .encoded ? "\(stem).mov" : "\(entry.number)-\(stem).mov"
+        try AppPaths.ensureDirectory(destinationDirectory)
+        let destination = destinationDirectory.appendingPathComponent(filename)
         guard destination != entry.url else { return }
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw AppError("该归档名称已存在，请换一个名称。")
@@ -400,10 +463,12 @@ enum AerialService {
         }
 
         var metadata = loadArchiveMetadata()
-        let oldRecord = metadata.removeValue(forKey: entry.url.lastPathComponent)
-        metadata[destination.lastPathComponent] = WallpaperArchiveMetadata(
+        let oldRecord = metadata.removeValue(forKey: archiveMetadataKey(for: entry.url))
+        metadata.removeValue(forKey: entry.url.lastPathComponent)
+        metadata[archiveMetadataKey(for: destination)] = WallpaperArchiveMetadata(
             uuid: entry.uuid ?? oldRecord?.uuid,
-            displayName: destination.deletingPathExtension().lastPathComponent
+            displayName: destination.deletingPathExtension().lastPathComponent,
+            kind: entry.kind
         )
 
         do {
@@ -433,6 +498,7 @@ enum AerialService {
             try FileManager.default.removeItem(at: entry.previewURL)
         }
         var metadata = loadArchiveMetadata()
+        metadata.removeValue(forKey: archiveMetadataKey(for: entry.url))
         metadata.removeValue(forKey: entry.url.lastPathComponent)
         try saveArchiveMetadata(metadata)
     }
@@ -468,6 +534,20 @@ enum AerialService {
         guard let separator = stem.firstIndex(of: "-") else { return nil }
         let candidate = String(stem[stem.index(after: separator)...])
         return normalizeUUID(candidate)
+    }
+
+    private static func uuidFromProcessedFilename(_ url: URL) -> String? {
+        let stem = url.deletingPathExtension().lastPathComponent
+        guard let separator = stem.range(of: "-fixed-") else { return nil }
+        return normalizeUUID(String(stem[..<separator.lowerBound]))
+    }
+
+    private static func archiveMetadataKey(for url: URL) -> String {
+        if url.deletingLastPathComponent().standardizedFileURL
+            == AppPaths.archiveDirectory.standardizedFileURL {
+            return url.lastPathComponent
+        }
+        return "\(AppPaths.encodedArchiveDirectory.lastPathComponent)/\(url.lastPathComponent)"
     }
 
     private static func loadArchiveMetadata() -> [String: WallpaperArchiveMetadata] {
@@ -509,6 +589,46 @@ enum AerialService {
             } catch {
                 try? FileManager.default.removeItem(at: destination)
             }
+        }
+    }
+
+    static func migrateProcessedOutputs() {
+        guard (try? AppPaths.ensureDirectory(AppPaths.archiveDirectory)) != nil,
+              (try? AppPaths.ensureDirectory(AppPaths.previewDirectory)) != nil,
+              (try? AppPaths.ensureDirectory(AppPaths.encodedArchiveDirectory)) != nil else {
+            return
+        }
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: AppPaths.processedDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        var metadata = loadArchiveMetadata()
+        var didChange = false
+        for url in urls where url.pathExtension.lowercased() == "mov" {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                continue
+            }
+            let destination = AppPaths.encodedArchiveDirectory.appendingPathComponent(url.lastPathComponent)
+            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
+            do {
+                try FileManager.default.moveItem(at: url, to: destination)
+                try verifyNonEmpty(destination)
+                metadata[archiveMetadataKey(for: destination)] = WallpaperArchiveMetadata(
+                    uuid: uuidFromProcessedFilename(destination),
+                    displayName: destination.deletingPathExtension().lastPathComponent,
+                    kind: .encoded
+                )
+                didChange = true
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+            }
+        }
+        if didChange {
+            try? saveArchiveMetadata(metadata)
         }
     }
 

@@ -75,6 +75,7 @@ final class AppModel: ObservableObject {
         previewTask = Task { @MainActor [weak self] in
             await Task.detached(priority: .utility) {
                 AerialService.migrateLegacyDesktopArchives()
+                AerialService.migrateProcessedOutputs()
             }.value
             guard let self, !Task.isCancelled else { return }
             let entries = AerialService.archiveEntries()
@@ -208,7 +209,7 @@ final class AppModel: ObservableObject {
     func startProcessing() {
         guard let values = validatedProcessingValues() else { return }
         let loopCount = max(1, Int(ceil(values.targetDuration / values.input.duration)))
-        let cropSelection = pendingCropSelection
+        let layout = pendingCropSelection ?? wallpaperLayout(for: values.input)
         pendingCropSelection = nil
         showProcessConfirmation = false
         runConversion(
@@ -217,7 +218,7 @@ final class AppModel: ObservableObject {
             loopCount: loopCount,
             bitrate: values.bitrate,
             archiveName: values.archiveName,
-            cropSelection: cropSelection
+            cropSelection: layout
         )
     }
 
@@ -268,6 +269,7 @@ final class AppModel: ObservableObject {
         do {
             try AppPaths.ensureDirectory(AppPaths.archiveDirectory)
             try AppPaths.ensureDirectory(AppPaths.previewDirectory)
+            try AppPaths.ensureDirectory(AppPaths.encodedArchiveDirectory)
             NSWorkspace.shared.open(AppPaths.archiveDirectory)
         } catch {
             alertMessage = "无法打开壁纸归档文件夹：\(error.localizedDescription)"
@@ -542,6 +544,14 @@ final class AppModel: ObservableObject {
                     try? AerialService.replaceAtomically(source: backup, target: target)
                     throw error
                 }
+                let encodedArchive: URL?
+                do {
+                    encodedArchive = try AerialService.archiveEncodedOutput(output, uuid: uuid)
+                } catch {
+                    encodedArchive = nil
+                    logger.write("Encoded history archive failed output=\(output.path): \(error.localizedDescription)")
+                }
+                let historyOutput = encodedArchive ?? output
                 progress = 7
 
                 phase = .running(number: 8, title: "重载 WallpaperAgent", detail: "仅重载一次系统壁纸服务…")
@@ -551,7 +561,7 @@ final class AppModel: ObservableObject {
                     uuid: uuid,
                     archiveURL: archive,
                     backupURL: backup,
-                    outputURL: output,
+                    outputURL: historyOutput,
                     reloadWarning: reloadWarning,
                     isRestore: false,
                     isArchiveReplacement: false
@@ -560,7 +570,7 @@ final class AppModel: ObservableObject {
                 backups = AerialService.backups(for: uuid)
                 targets = AerialService.targets()
                 refreshArchives()
-                logger.write("Success uuid=\(uuid) archive=\(archive.path) backup=\(backup.path) output=\(output.path) reloadWarning=\(reloadWarning ?? "none")")
+                logger.write("Success uuid=\(uuid) archive=\(archive.path) backup=\(backup.path) output=\(historyOutput.path) reloadWarning=\(reloadWarning ?? "none")")
             } catch {
                 phase = .failed(error.localizedDescription)
                 alertMessage = error.localizedDescription
@@ -579,31 +589,43 @@ final class AppModel: ObservableObject {
     }
 
     private func cropSelection(for input: InputVideoInfo) -> WallpaperCropSelection? {
-        guard let screenSize = NSScreen.main?.frame.size,
-              screenSize.width > 0,
-              screenSize.height > 0 else {
+        guard let display = displayPixelSize(),
+              abs(Double(input.width) / Double(input.height) - display.aspect) > 0.005 else {
             return nil
         }
-        let sourceAspect = Double(input.width) / Double(input.height)
-        let screenAspect = screenSize.width / screenSize.height
-        guard abs(sourceAspect - screenAspect) > 0.005 else { return nil }
+        return wallpaperLayout(for: input)
+    }
 
+    private func wallpaperLayout(for input: InputVideoInfo) -> WallpaperCropSelection? {
+        guard let display = displayPixelSize() else { return nil }
         let sourceWidth = Double(input.width)
         let sourceHeight = Double(input.height)
+        let sourceAspect = sourceWidth / sourceHeight
         let cropWidth: Double
         let cropHeight: Double
         let originX: Double
         let originY: Double
-        if sourceAspect > screenAspect {
-            cropWidth = Double(max(2, Int((sourceHeight * screenAspect).rounded(.down)) & ~1))
+
+        if abs(sourceAspect - display.aspect) <= 0.005 {
+            cropWidth = sourceWidth
+            cropHeight = sourceHeight
+            originX = 0
+            originY = 0
+        } else if sourceAspect > display.aspect {
+            cropWidth = Double(max(2, Int((sourceHeight * display.aspect).rounded(.down)) & ~1))
             cropHeight = sourceHeight
             originX = (sourceWidth - cropWidth) / 2
             originY = 0
-        } else {
+        } else if sourceAspect < display.aspect {
             cropWidth = sourceWidth
-            cropHeight = Double(max(2, Int((sourceWidth / screenAspect).rounded(.down)) & ~1))
+            cropHeight = Double(max(2, Int((sourceWidth / display.aspect).rounded(.down)) & ~1))
             originX = 0
             originY = (sourceHeight - cropHeight) / 2
+        } else {
+            cropWidth = sourceWidth
+            cropHeight = sourceHeight
+            originX = 0
+            originY = 0
         }
 
         var selection = WallpaperCropSelection(
@@ -611,11 +633,29 @@ final class AppModel: ObservableObject {
             sourceHeight: sourceHeight,
             cropWidth: cropWidth,
             cropHeight: cropHeight,
+            outputWidth: display.width,
+            outputHeight: display.height,
             originX: originX,
             originY: originY
         )
         selection.clamp()
         return selection
+    }
+
+    private func displayPixelSize() -> (width: Int, height: Int, aspect: Double)? {
+        guard let screen = NSScreen.main,
+              screen.frame.width > 0,
+              screen.frame.height > 0 else {
+            return nil
+        }
+        let scale = max(1, screen.backingScaleFactor)
+        let width = max(2, Int((screen.frame.width * scale).rounded()) & ~1)
+        let height = max(2, Int((screen.frame.height * scale).rounded()) & ~1)
+        return (
+            width: width,
+            height: height,
+            aspect: screen.frame.width / screen.frame.height
+        )
     }
 
     private func processedOutputURL(uuid: String) throws -> URL {

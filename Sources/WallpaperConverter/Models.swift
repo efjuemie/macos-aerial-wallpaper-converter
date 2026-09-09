@@ -42,9 +42,15 @@ struct BackupEntry: Identifiable, Hashable, Sendable {
     }
 }
 
+enum WallpaperArchiveKind: String, Codable, Sendable {
+    case original
+    case encoded
+}
+
 struct WallpaperArchiveMetadata: Codable, Sendable {
     let uuid: String?
     var displayName: String
+    let kind: WallpaperArchiveKind?
 }
 
 struct WallpaperArchiveEntry: Identifiable, Hashable, Sendable {
@@ -53,6 +59,7 @@ struct WallpaperArchiveEntry: Identifiable, Hashable, Sendable {
     let number: Int
     let uuid: String?
     let displayName: String
+    let kind: WallpaperArchiveKind
 
     var id: URL { url }
 
@@ -61,9 +68,14 @@ struct WallpaperArchiveEntry: Identifiable, Hashable, Sendable {
     }
 
     var editableName: String {
+        guard kind == .original else { return displayName }
         let prefix = "\(number)-"
         guard displayName.hasPrefix(prefix) else { return displayName }
         return String(displayName.dropFirst(prefix.count))
+    }
+
+    var kindLabel: String {
+        kind == .encoded ? "已编码" : "原壁纸"
     }
 }
 
@@ -72,16 +84,10 @@ struct WallpaperCropSelection: Equatable, Sendable {
     let sourceHeight: Double
     let cropWidth: Double
     let cropHeight: Double
+    let outputWidth: Int
+    let outputHeight: Int
     var originX: Double
     var originY: Double
-
-    var outputWidth: Int {
-        max(2, Int(cropWidth.rounded(.down)) & ~1)
-    }
-
-    var outputHeight: Int {
-        max(2, Int(cropHeight.rounded(.down)) & ~1)
-    }
 
     mutating func clamp() {
         originX = min(max(0, originX), max(0, sourceWidth - cropWidth))
