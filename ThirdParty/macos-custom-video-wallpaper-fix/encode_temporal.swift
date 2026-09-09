@@ -41,6 +41,7 @@ final class StreamWriter {
             let w = try! AVAssetWriter(outputURL: outURL, fileType: .mov)
             let inp = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: fmt)
             inp.expectsMediaDataInRealTime = false
+            inp.transform = .identity
             w.add(inp); w.startWriting()
             w.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sb))
             writer = w; input = inp; started = true
@@ -77,6 +78,13 @@ func setP(_ key: CFString, _ val: CFTypeRef) {
     let s = VTSessionSetProperty(session, key: key, value: val)
     if s != noErr { FileHandle.standardError.write("set \(key) failed: \(s)\n".data(using:.utf8)!) }
 }
+func setRequiredP(_ key: CFString, _ val: CFTypeRef) {
+    let status = VTSessionSetProperty(session, key: key, value: val)
+    guard status == noErr else {
+        FileHandle.standardError.write("required set \(key) failed: \(status)\n".data(using:.utf8)!)
+        exit(1)
+    }
+}
 setP(kVTCompressionPropertyKey_RealTime, kCFBooleanFalse)
 setP(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main10_AutoLevel)
 setP(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue)
@@ -86,6 +94,18 @@ setP(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate))
 setP(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2)
 setP(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2)
 setP(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+let cleanAperture: [CFString: Any] = [
+    kCMFormatDescriptionKey_CleanApertureWidth: W,
+    kCMFormatDescriptionKey_CleanApertureHeight: H,
+    kCMFormatDescriptionKey_CleanApertureHorizontalOffset: 0,
+    kCMFormatDescriptionKey_CleanApertureVerticalOffset: 0
+]
+let squarePixelAspect: [CFString: Any] = [
+    kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing: 1,
+    kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing: 1
+]
+setRequiredP(kVTCompressionPropertyKey_CleanAperture, cleanAperture as CFDictionary)
+setRequiredP(kVTCompressionPropertyKey_PixelAspectRatio, squarePixelAspect as CFDictionary)
 // Temporal scalability (2 sub-layers) emits tscl/tsas sample groups.
 setP(kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue)
 setP(kVTCompressionPropertyKey_BaseLayerFrameRate, NSNumber(value: Double(nomFps) / 2.0))

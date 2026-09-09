@@ -43,7 +43,7 @@ struct CropSheetView: View {
                 HStack {
                     Text("原视频：\(info.width) × \(info.height)")
                     Spacer()
-                    Text("裁剪输出：\(selection.outputWidth) × \(selection.outputHeight)")
+                    Text("目标编码画布：\(selection.outputWidth) × \(selection.outputHeight)")
                     Text("比例 \(aspectText(selection.cropWidth / selection.cropHeight))")
                 }
                 .font(.caption)
@@ -134,15 +134,16 @@ private struct CropPreviewCanvas: View {
                                     if dragStart == nil {
                                         dragStart = start
                                     }
-                                    let maxX = max(0, selection.sourceWidth - selection.cropWidth)
-                                    let maxY = max(0, selection.sourceHeight - selection.cropHeight)
+                                    guard let range = WallpaperGeometry.achievableOriginRange(
+                                        for: selection
+                                    ) else { return }
                                     let originX = min(
-                                        max(0, Double(start.x) + Double(value.translation.width) / Double(scaleX)),
-                                        maxX
+                                        max(range.minX, Double(start.x) + Double(value.translation.width) / Double(scaleX)),
+                                        range.maxX
                                     )
                                     let originY = min(
-                                        max(0, Double(start.y) + Double(value.translation.height) / Double(scaleY)),
-                                        maxY
+                                        max(range.minY, Double(start.y) + Double(value.translation.height) / Double(scaleY)),
+                                        range.maxY
                                     )
                                     onMove(originX, originY)
                                 }

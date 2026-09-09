@@ -2,6 +2,7 @@ import CryptoKit
 @preconcurrency import AVFoundation
 import AppKit
 import Foundation
+import ImageIO
 
 private final class ExportSessionBox: @unchecked Sendable {
     let session: AVAssetExportSession
@@ -96,32 +97,24 @@ enum EncoderService {
         loopCount: Int,
         bitrateMbps: Int,
         executable: URL,
-        cropSelection: WallpaperCropSelection? = nil
-    ) async throws {
+        cropSelection: WallpaperCropSelection
+    ) async throws -> String {
         try AppPaths.ensureDirectory(output.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: output)
-        let croppedInput: URL?
-        if let cropSelection {
-            let temporaryInput = output.deletingLastPathComponent().appendingPathComponent(
-                ".wallpaper-converter-crop-\(UUID().uuidString).mov"
-            )
-            try await VideoAspectService.renderCrop(
-                input: input,
-                output: temporaryInput,
-                crop: cropSelection
-            )
-            croppedInput = temporaryInput
-        } else {
-            croppedInput = nil
-        }
+        let croppedInput = output.deletingLastPathComponent().appendingPathComponent(
+            ".wallpaper-converter-crop-\(UUID().uuidString).mov"
+        )
+        try await VideoAspectService.renderCrop(
+            input: input,
+            output: croppedInput,
+            crop: cropSelection
+        )
         defer {
-            if let croppedInput {
-                try? FileManager.default.removeItem(at: croppedInput)
-            }
+            try? FileManager.default.removeItem(at: croppedInput)
         }
         let result = try await CommandRunner.run(
             executable,
-            arguments: [croppedInput?.path ?? input.path, output.path, String(loopCount), String(bitrateMbps)],
+            arguments: [croppedInput.path, output.path, String(loopCount), String(bitrateMbps)],
             currentDirectory: executable.deletingLastPathComponent()
         )
         guard result.status == 0 else {
@@ -131,6 +124,10 @@ enum EncoderService {
               (try? FileManager.default.attributesOfItem(atPath: output.path)[.size] as? NSNumber)?.int64Value ?? 0 > 0 else {
             throw AppError("编码器没有生成有效输出文件。")
         }
+        return try await VideoGeometryService.validateFixedCanvas(
+            at: output,
+            expected: AerialCanvas(width: cropSelection.outputWidth, height: cropSelection.outputHeight)
+        )
     }
 
     static func validate(output: URL, repository: URL) async throws -> String {
@@ -157,6 +154,134 @@ enum EncoderService {
             throw AppError("视频未通过 Aerial 兼容性验证，缺少：\n\(missing.joined(separator: "\n"))\n\n原始验证输出：\n\(result.output)")
         }
         return result.output
+    }
+}
+
+struct VideoGeometrySnapshot: Sendable {
+    let naturalSize: CGSize
+    let preferredTransform: CGAffineTransform
+    let encodedSize: CMVideoDimensions
+    let cleanAperture: CGRect
+    let presentationSize: CGSize
+    let pixelAspectRatio: (horizontal: Int, vertical: Int)?
+    let hasExplicitCleanAperture: Bool
+
+    var hasIdentityTransform: Bool {
+        approximatelyEqual(preferredTransform.a, 1)
+            && approximatelyEqual(preferredTransform.b, 0)
+            && approximatelyEqual(preferredTransform.c, 0)
+            && approximatelyEqual(preferredTransform.d, 1)
+            && approximatelyEqual(preferredTransform.tx, 0)
+            && approximatelyEqual(preferredTransform.ty, 0)
+    }
+
+    var hasSquarePixels: Bool {
+        pixelAspectRatio.map { $0.horizontal == $0.vertical } ?? true
+    }
+
+    var hasExplicitSquarePixels: Bool {
+        pixelAspectRatio.map { $0.horizontal == 1 && $0.vertical == 1 } ?? false
+    }
+
+    var fixedCanvasEvidence: AerialCanvas? {
+        let width = Int(encodedSize.width)
+        let height = Int(encodedSize.height)
+        guard width > 1,
+              height > 1,
+              width.isMultiple(of: 2),
+              height.isMultiple(of: 2),
+              approximatelyEqual(naturalSize.width, CGFloat(width)),
+              approximatelyEqual(naturalSize.height, CGFloat(height)),
+              approximatelyEqual(cleanAperture.width, CGFloat(width)),
+              approximatelyEqual(cleanAperture.height, CGFloat(height)),
+              approximatelyEqual(presentationSize.width, CGFloat(width)),
+              approximatelyEqual(presentationSize.height, CGFloat(height)),
+              hasIdentityTransform,
+              hasSquarePixels else {
+            return nil
+        }
+        return AerialCanvas(width: width, height: height)
+    }
+
+    private func approximatelyEqual(_ left: CGFloat, _ right: CGFloat) -> Bool {
+        abs(left - right) < 0.01
+    }
+}
+
+enum VideoGeometryService {
+    static func inspect(_ url: URL) async throws -> VideoGeometrySnapshot {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw AppError("视频中没有可用于画布验证的视频轨道。")
+        }
+        let naturalSize = try await track.load(.naturalSize)
+        let preferredTransform = try await track.load(.preferredTransform)
+        guard let description = try await track.load(.formatDescriptions).first else {
+            throw AppError("视频轨道缺少格式描述，无法验证显示尺寸。")
+        }
+        let extensions = CMFormatDescriptionGetExtensions(description) as NSDictionary? ?? [:]
+        let hasExplicitCleanAperture = extensions[kCMFormatDescriptionExtension_CleanAperture] != nil
+        let pixelAspectRatio: (horizontal: Int, vertical: Int)?
+        if let values = extensions[kCMFormatDescriptionExtension_PixelAspectRatio] as? NSDictionary,
+           let horizontal = values[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing] as? NSNumber,
+           let vertical = values[kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing] as? NSNumber {
+            pixelAspectRatio = (horizontal.intValue, vertical.intValue)
+        } else {
+            pixelAspectRatio = nil
+        }
+        return VideoGeometrySnapshot(
+            naturalSize: naturalSize,
+            preferredTransform: preferredTransform,
+            encodedSize: CMVideoFormatDescriptionGetDimensions(description),
+            cleanAperture: CMVideoFormatDescriptionGetCleanAperture(
+                description,
+                originIsAtTopLeft: true
+            ),
+            presentationSize: CMVideoFormatDescriptionGetPresentationDimensions(
+                description,
+                usePixelAspectRatio: true,
+                useCleanAperture: true
+            ),
+            pixelAspectRatio: pixelAspectRatio,
+            hasExplicitCleanAperture: hasExplicitCleanAperture
+        )
+    }
+
+    static func validateFixedCanvas(
+        at url: URL,
+        expected: AerialCanvas,
+        requireExplicitMetadata: Bool = true
+    ) async throws -> String {
+        let geometry = try await inspect(url)
+        let width = CGFloat(expected.width)
+        let height = CGFloat(expected.height)
+        let matches = approximatelyEqual(geometry.naturalSize.width, width)
+            && approximatelyEqual(geometry.naturalSize.height, height)
+            && geometry.encodedSize.width == Int32(expected.width)
+            && geometry.encodedSize.height == Int32(expected.height)
+            && approximatelyEqual(geometry.cleanAperture.width, width)
+            && approximatelyEqual(geometry.cleanAperture.height, height)
+            && approximatelyEqual(geometry.presentationSize.width, width)
+            && approximatelyEqual(geometry.presentationSize.height, height)
+            && geometry.hasIdentityTransform
+            && geometry.hasSquarePixels
+            && (!requireExplicitMetadata || geometry.hasExplicitCleanAperture)
+            && (!requireExplicitMetadata || geometry.hasExplicitSquarePixels)
+        guard matches else {
+            throw AppError(
+                "输出画布验证失败：要求 \(expected.width)×\(expected.height)、方形像素和恒等显示变换；" +
+                "实际 encoded=\(geometry.encodedSize.width)×\(geometry.encodedSize.height)，" +
+                "presentation=\(Int(geometry.presentationSize.width))×\(Int(geometry.presentationSize.height))，" +
+                "explicitCleanAperture=\(geometry.hasExplicitCleanAperture)，" +
+                "explicitPAR=\(geometry.pixelAspectRatio != nil)。"
+            )
+        }
+        let metadata = requireExplicitMetadata ? "explicit clean aperture/PAR" : "semantic clean aperture/PAR"
+        return "encoded/natural/clean/presentation=\(expected.width)x\(expected.height), pixelAspect=1:1, transform=identity, \(metadata)"
+    }
+
+    private static func approximatelyEqual(_ left: CGFloat, _ right: CGFloat) -> Bool {
+        abs(left - right) < 0.01
     }
 }
 
@@ -193,21 +318,14 @@ enum VideoAspectService {
             tx: preferredTransform.tx - transformedBounds.minX,
             ty: preferredTransform.ty - transformedBounds.minY
         )
-        let outputWidth = CGFloat(crop.outputWidth)
-        let outputHeight = CGFloat(crop.outputHeight)
-        let scale = max(
-            outputWidth / CGFloat(crop.cropWidth),
-            outputHeight / CGFloat(crop.cropHeight)
-        )
-        let overflowX = (outputWidth - CGFloat(crop.cropWidth) * scale) / 2
-        let overflowY = (outputHeight - CGFloat(crop.cropHeight) * scale) / 2
+        let placement = WallpaperGeometry.renderPlacement(for: crop)
         let transform = CGAffineTransform(
-            a: normalizedTransform.a * scale,
-            b: normalizedTransform.b * scale,
-            c: normalizedTransform.c * scale,
-            d: normalizedTransform.d * scale,
-            tx: normalizedTransform.tx * scale - CGFloat(crop.originX) * scale + overflowX,
-            ty: normalizedTransform.ty * scale - CGFloat(crop.originY) * scale + overflowY
+            a: normalizedTransform.a * placement.scale,
+            b: normalizedTransform.b * placement.scale,
+            c: normalizedTransform.c * placement.scale,
+            d: normalizedTransform.d * placement.scale,
+            tx: normalizedTransform.tx * placement.scale + placement.translationX,
+            ty: normalizedTransform.ty * placement.scale + placement.translationY
         )
 
         let videoComposition = AVMutableVideoComposition()
@@ -223,10 +341,16 @@ enum VideoAspectService {
         instruction.layerInstructions = [layerInstruction]
         videoComposition.instructions = [instruction]
 
-        guard let exporter = AVAssetExportSession(
-            asset: asset,
-            presetName: AVAssetExportPresetHighestQuality
-        ) else {
+        let presetName: String
+        if crop.outputWidth <= 3840 && crop.outputHeight <= 2160
+            && (crop.outputWidth > 1920 || crop.outputHeight > 1080) {
+            presetName = AVAssetExportPresetHEVC3840x2160
+        } else if crop.outputWidth <= 1920 && crop.outputHeight <= 1080 {
+            presetName = AVAssetExportPresetHEVC1920x1080
+        } else {
+            presetName = AVAssetExportPresetHEVCHighestQuality
+        }
+        guard let exporter = AVAssetExportSession(asset: asset, presetName: presetName) else {
             throw AppError("无法创建视频比例处理任务。")
         }
         try? FileManager.default.removeItem(at: output)
@@ -241,7 +365,10 @@ enum VideoAspectService {
                 if exporterBox.session.status == .completed {
                     continuation.resume()
                 } else {
-                    let detail = exporterBox.session.error?.localizedDescription ?? "未知错误"
+                    let detail = exporterBox.session.error.map {
+                        let error = $0 as NSError
+                        return "\(error.localizedDescription) [\(error.domain) \(error.code)] \(error.userInfo)"
+                    } ?? "未知错误"
                     continuation.resume(throwing: AppError("视频比例处理失败：\(detail)"))
                 }
             }
@@ -249,6 +376,11 @@ enum VideoAspectService {
         guard FileManager.default.isReadableFile(atPath: output.path) else {
             throw AppError("视频比例处理没有生成有效文件。")
         }
+        _ = try await VideoGeometryService.validateFixedCanvas(
+            at: output,
+            expected: AerialCanvas(width: crop.outputWidth, height: crop.outputHeight),
+            requireExplicitMetadata: false
+        )
     }
 }
 
@@ -260,24 +392,125 @@ enum PreviewService {
     }
 
     static func firstFrameJPEG(from video: URL) async throws -> Data {
-        let asset = AVAsset(url: video)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 1920, height: 1080)
-        let result = try await generator.image(at: .zero)
-        let bitmap = NSBitmapImageRep(cgImage: result.image)
-        guard let data = bitmap.representation(
-            using: .jpeg,
-            properties: [.compressionFactor: 0.88]
-        ) else {
-            throw AppError("无法生成动态壁纸首帧预览。")
+        let asset = AVURLAsset(url: video)
+        guard try await asset.loadTracks(withMediaType: .video).first != nil else {
+            throw AppError("视频中没有可生成预览的视频轨道。")
         }
-        return data
+        let duration = try await asset.load(.duration).seconds
+        guard duration.isFinite, duration > 0 else {
+            throw AppError("视频时长无效，无法生成预览。")
+        }
+        let safeEnd = max(0, duration - 1.0 / 60.0)
+        let seconds = [
+            min(0.10, safeEnd),
+            min(max(0.25, duration * 0.05), safeEnd),
+            min(max(0.50, duration * 0.10), safeEnd),
+            0
+        ].reduce(into: [Double]()) { values, value in
+            if !values.contains(where: { abs($0 - value) < 0.001 }) {
+                values.append(value)
+            }
+        }
+        var failures: [String] = []
+        for second in seconds {
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 1920, height: 1080)
+            generator.requestedTimeToleranceBefore = CMTime(seconds: 0.25, preferredTimescale: 600)
+            generator.requestedTimeToleranceAfter = CMTime(seconds: 0.50, preferredTimescale: 600)
+            do {
+                let result = try await generator.image(
+                    at: CMTime(seconds: second, preferredTimescale: 600)
+                )
+                let bitmap = NSBitmapImageRep(cgImage: result.image)
+                if let data = bitmap.representation(
+                    using: .jpeg,
+                    properties: [.compressionFactor: 0.88]
+                ), !data.isEmpty {
+                    return data
+                }
+                failures.append(String(format: "%.2fs: JPEG 编码失败", second))
+            } catch {
+                failures.append(String(format: "%.2fs: %@", second, error.localizedDescription))
+            }
+        }
+        throw AppError("多个安全取帧时刻均失败：\(failures.joined(separator: "；"))")
+    }
+
+    static func isValidPreview(at url: URL) -> Bool {
+        validPreviewData(at: url) != nil
+    }
+
+    static func validPreviewData(at url: URL) -> Data? {
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let image = CGImageSourceCreateImageAtIndex(
+                  source,
+                  0,
+                  [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+              ),
+              image.width > 0,
+              image.height > 0,
+              let context = CGContext(
+                  data: nil,
+                  width: 1,
+                  height: 1,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        return context.data == nil ? nil : data
+    }
+}
+
+enum NativeCanvasStore {
+    static func load(from url: URL) throws -> [String: AerialCanvas] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        do {
+            let data = try Data(contentsOf: url)
+            return try JSONDecoder().decode([String: AerialCanvas].self, from: data)
+        } catch {
+            throw AppError("原生画布记录无法读取，请检查或移走该文件后重试：\(url.path)")
+        }
+    }
+
+    static func save(
+        _ canvas: AerialCanvas,
+        uuid: String,
+        to url: URL
+    ) throws {
+        var records = try load(from: url)
+        records[uuid] = canvas
+        try AppPaths.ensureDirectory(url.deletingLastPathComponent())
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(records).write(to: url, options: [.atomic])
     }
 }
 
 enum AerialService {
     private static let uuidPattern = #"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"#
+
+    private struct Manifest: Decodable {
+        let assets: [ManifestAsset]
+    }
+
+    private struct ManifestAsset: Decodable {
+        let id: String
+        let url4K: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case url4K = "url-4K-SDR-240FPS"
+        }
+    }
 
     static func normalizeUUID(_ value: String) -> String? {
         let candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -312,6 +545,137 @@ enum AerialService {
             throw AppError("UUID 格式不正确。")
         }
         return AppPaths.aerialDirectory.appendingPathComponent("\(normalized).mov")
+    }
+
+    static func outputCanvas(
+        for target: URL,
+        uuid: String,
+        recordsURL: URL = AppPaths.nativeCanvasRecordsURL
+    ) async throws -> AerialCanvas {
+        let normalizedUUID = normalizeUUID(uuid) ?? uuid.uppercased()
+        let records = try NativeCanvasStore.load(from: recordsURL)
+        let persistedCanvas = records[normalizedUUID]
+        let manifestCanvas = explicitManifestCanvas(uuid: normalizedUUID)
+        let matchingArchives = archiveEntries().filter { entry in
+            let filenameUUID = normalizeUUID(entry.url.deletingPathExtension().lastPathComponent)
+            return entry.uuid == normalizedUUID || filenameUUID == normalizedUUID
+        }
+        let originalArchives = matchingArchives.filter { $0.kind == .original }
+        let backupEntries = backups(for: normalizedUUID)
+        let hasAnyHistoricalRecords = !matchingArchives.isEmpty || !backupEntries.isEmpty
+
+        var resolution = NativeCanvasResolver.resolve(
+            persistedCanvas: persistedCanvas,
+            manifestCanvas: manifestCanvas,
+            targetCanvas: nil,
+            hasAnyHistoricalRecords: hasAnyHistoricalRecords,
+            earliestOriginalCanvas: nil,
+            earliestBackupCanvas: nil
+        )
+        if resolution == nil, !hasAnyHistoricalRecords {
+            resolution = NativeCanvasResolver.resolve(
+                persistedCanvas: nil,
+                manifestCanvas: nil,
+                targetCanvas: try? await fixedCanvas(at: target),
+                hasAnyHistoricalRecords: false,
+                earliestOriginalCanvas: nil,
+                earliestBackupCanvas: nil
+            )
+        }
+        if resolution == nil, hasAnyHistoricalRecords {
+            let earliestOriginal = originalArchives.min(by: isEarlierOriginalArchive)
+            let earliestBackup = backupEntries.min {
+                backupChronology($0) < backupChronology($1)
+            }
+            let earliestOriginalCanvas: AerialCanvas?
+            if let earliestOriginal {
+                earliestOriginalCanvas = try? await fixedCanvas(at: earliestOriginal.url)
+            } else {
+                earliestOriginalCanvas = nil
+            }
+            let earliestBackupCanvas: AerialCanvas?
+            if let earliestBackup {
+                earliestBackupCanvas = try? await fixedCanvas(at: earliestBackup.url)
+            } else {
+                earliestBackupCanvas = nil
+            }
+            resolution = NativeCanvasResolver.resolve(
+                persistedCanvas: nil,
+                manifestCanvas: nil,
+                targetCanvas: nil,
+                hasAnyHistoricalRecords: true,
+                earliestOriginalCanvas: earliestOriginalCanvas,
+                earliestBackupCanvas: earliestBackupCanvas
+            )
+        }
+        guard let resolution else {
+            throw AppError(
+                "无法可靠判定该系统动态壁纸的原生编码画布。请先在系统设置中重新下载该动态壁纸，" +
+                "或确认同 UUID 最早的原壁纸归档与最早备份完整且画布一致后重试。"
+            )
+        }
+        if resolution.shouldPersist {
+            try NativeCanvasStore.save(resolution.canvas, uuid: normalizedUUID, to: recordsURL)
+        }
+        return resolution.canvas
+    }
+
+    private static func fixedCanvas(at url: URL) async throws -> AerialCanvas? {
+        try await VideoGeometryService.inspect(url).fixedCanvasEvidence
+    }
+
+    private static func isEarlierOriginalArchive(
+        _ left: WallpaperArchiveEntry,
+        _ right: WallpaperArchiveEntry
+    ) -> Bool {
+        if left.number != right.number { return left.number < right.number }
+        let leftDate = (try? left.url.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate ?? .distantFuture
+        let rightDate = (try? right.url.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate ?? .distantFuture
+        return leftDate < rightDate
+    }
+
+    private static func backupChronology(_ entry: BackupEntry) -> Date {
+        let stem = entry.url.deletingPathExtension().lastPathComponent
+        if let range = stem.range(
+            of: #"[0-9]{8}-[0-9]{6}"#,
+            options: [.regularExpression, .backwards]
+        ), let date = DateFormatter.fileTimestamp.date(from: String(stem[range])) {
+            return date
+        }
+        return entry.date
+    }
+
+    private static func explicitManifestCanvas(uuid: String) -> AerialCanvas? {
+        guard let data = try? Data(contentsOf: AppPaths.aerialManifestURL),
+              let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+              let asset = manifest.assets.first(where: {
+                  $0.id.caseInsensitiveCompare(uuid) == .orderedSame
+              }),
+              let url = asset.url4K else {
+            return nil
+        }
+        if let match = url.range(
+            of: #"(?i)([1-9][0-9]{2,4})x([1-9][0-9]{2,4})"#,
+            options: .regularExpression
+        ) {
+            let dimensions = url[match].lowercased().split(separator: "x")
+            if dimensions.count == 2,
+               let width = Int(dimensions[0]),
+               let height = Int(dimensions[1]) {
+                return AerialCanvas(width: width & ~1, height: height & ~1)
+            }
+        }
+        if let match = url.range(
+            of: #"(?i)(?:^|[_-])t(2160|1080)(?:[_\.-]|$)"#,
+            options: .regularExpression
+        ) {
+            let marker = url[match]
+            let height = marker.contains("2160") ? 2160 : 1080
+            return AerialCanvas(width: height * 16 / 9, height: height)
+        }
+        return nil
     }
 
     static func createBackup(of target: URL, uuid: String, suffix: String? = nil) throws -> URL {
@@ -531,6 +895,7 @@ enum AerialService {
 
     private static func uuidFromArchiveFilename(_ url: URL) -> String? {
         let stem = url.deletingPathExtension().lastPathComponent
+        if let uuid = normalizeUUID(stem) { return uuid }
         guard let separator = stem.firstIndex(of: "-") else { return nil }
         let candidate = String(stem[stem.index(after: separator)...])
         return normalizeUUID(candidate)

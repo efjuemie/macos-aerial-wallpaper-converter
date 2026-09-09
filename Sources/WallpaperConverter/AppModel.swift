@@ -1,6 +1,12 @@
 import AppKit
 import Foundation
 
+private enum PreviewRefreshResult: Sendable {
+    case valid
+    case generated
+    case failed(String)
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     static let defaultUUID = "00BA71CD-2C54-415A-A68A-8358E677D750"
@@ -23,6 +29,8 @@ final class AppModel: ObservableObject {
     @Published var selectedArchive: WallpaperArchiveEntry?
     @Published var archiveRenameText = ""
     @Published var isGeneratingPreviews = false
+    @Published var previewFailures: Set<URL> = []
+    @Published var previewRevision = 0
     @Published var archiveToDelete: WallpaperArchiveEntry?
     @Published var showArchiveDeleteConfirmation = false
     @Published var showArchiveReplaceConfirmation = false
@@ -31,6 +39,7 @@ final class AppModel: ObservableObject {
     @Published var alertMessage: String?
     @Published var isProcessing = false
     @Published var isInspectingVideo = false
+    @Published var isPreparingLayout = false
     @Published var archiveNameText = ""
     @Published var pendingCropSelection: WallpaperCropSelection?
     @Published var showCropSheet = false
@@ -50,7 +59,11 @@ final class AppModel: ObservableObject {
     }
 
     var canStart: Bool {
-        inputInfo != nil && AerialService.normalizeUUID(uuidText) != nil && !isProcessing && !isInspectingVideo
+        inputInfo != nil
+            && selectedTargetExists
+            && !isProcessing
+            && !isInspectingVideo
+            && !isPreparingLayout
     }
 
     var selectedTargetExists: Bool {
@@ -60,8 +73,7 @@ final class AppModel: ObservableObject {
 
     func refresh() {
         Task {
-            targets = AerialService.targets()
-            backups = AerialService.backups(for: AerialService.normalizeUUID(uuidText) ?? Self.defaultUUID)
+            refreshTargets()
             environmentChecks = await EnvironmentChecker.check()
             let status = await EnvironmentChecker.oldLaunchAgentStatus()
             oldAgentWarning = status.isRunning ? status.detail : nil
@@ -69,35 +81,75 @@ final class AppModel: ObservableObject {
         refreshArchives()
     }
 
+    func refreshTargets() {
+        targets = AerialService.targets()
+        backups = AerialService.backups(for: AerialService.normalizeUUID(uuidText) ?? Self.defaultUUID)
+    }
+
     func refreshArchives() {
-        previewTask?.cancel()
+        let previousTask = previewTask
+        previousTask?.cancel()
         isGeneratingPreviews = true
         previewTask = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard !Task.isCancelled else { return }
             await Task.detached(priority: .utility) {
                 AerialService.migrateLegacyDesktopArchives()
                 AerialService.migrateProcessedOutputs()
             }.value
             guard let self, !Task.isCancelled else { return }
-            let entries = AerialService.archiveEntries()
+            let entries = await Task.detached(priority: .utility) {
+                AerialService.archiveEntries()
+            }.value
             self.archiveEntries = entries
+            let currentPreviewURLs = Set(entries.map(\.previewURL))
+            self.previewFailures.formIntersection(currentPreviewURLs)
             if let selectedArchive = self.selectedArchive {
                 self.selectedArchive = entries.first { $0.url == selectedArchive.url }
             }
             guard !entries.isEmpty else {
                 self.isGeneratingPreviews = false
+                self.previewRevision += 1
                 return
             }
             for entry in entries {
                 guard !Task.isCancelled else { return }
-                guard !FileManager.default.fileExists(atPath: entry.previewURL.path) else { continue }
-                try? await PreviewService.generateFirstFrame(from: entry.url, to: entry.previewURL)
+                let result = await Task.detached(priority: .utility) {
+                    () async -> PreviewRefreshResult in
+                    if PreviewService.isValidPreview(at: entry.previewURL) {
+                        return .valid
+                    }
+                    do {
+                        try await PreviewService.generateFirstFrame(
+                            from: entry.url,
+                            to: entry.previewURL
+                        )
+                        return .generated
+                    } catch {
+                        return .failed(error.localizedDescription)
+                    }
+                }.value
+                guard !Task.isCancelled else { return }
+                switch result {
+                case .valid:
+                    self.previewFailures.remove(entry.previewURL)
+                case .generated:
+                    self.previewFailures.remove(entry.previewURL)
+                    self.logger.write("Preview generated archive=\(entry.url.path) preview=\(entry.previewURL.path)")
+                case let .failed(message):
+                    self.previewFailures.insert(entry.previewURL)
+                    self.logger.write("Preview generation failed archive=\(entry.url.path): \(message)")
+                }
             }
             guard !Task.isCancelled else { return }
-            self.archiveEntries = AerialService.archiveEntries()
+            self.archiveEntries = await Task.detached(priority: .utility) {
+                AerialService.archiveEntries()
+            }.value
             if let selectedArchive = self.selectedArchive {
                 self.selectedArchive = self.archiveEntries.first { $0.url == selectedArchive.url }
             }
             self.isGeneratingPreviews = false
+            self.previewRevision += 1
         }
     }
 
@@ -172,12 +224,40 @@ final class AppModel: ObservableObject {
 
     func requestProcessing() {
         guard let values = validatedProcessingValues() else { return }
-        if let selection = cropSelection(for: values.input) {
-            pendingCropSelection = selection
-            showCropSheet = true
-        } else {
-            pendingCropSelection = nil
-            showProcessConfirmation = true
+        let target: URL
+        do {
+            target = try AerialService.targetURL(uuid: values.uuid)
+        } catch {
+            alertMessage = error.localizedDescription
+            return
+        }
+        guard FileManager.default.isReadableFile(atPath: target.path) else {
+            alertMessage = "请先在系统设置→壁纸中下载动态壁纸。"
+            return
+        }
+        isPreparingLayout = true
+        Task {
+            do {
+                let canvas = try await AerialService.outputCanvas(for: target, uuid: values.uuid)
+                guard let layout = wallpaperLayout(for: values.input, outputCanvas: canvas) else {
+                    throw AppError("无法读取主显示器尺寸，不能安全生成壁纸画布。")
+                }
+                pendingCropSelection = layout
+                logger.write(
+                    "Prepared canvas uuid=\(values.uuid) output=\(canvas.width)x\(canvas.height) " +
+                    "visibleCrop=\(Int(layout.cropWidth))x\(Int(layout.cropHeight))"
+                )
+                if requiresCrop(for: values.input) {
+                    showCropSheet = true
+                } else {
+                    showProcessConfirmation = true
+                }
+            } catch {
+                pendingCropSelection = nil
+                alertMessage = error.localizedDescription
+                logger.write("Canvas preparation failed uuid=\(values.uuid): \(error.localizedDescription)")
+            }
+            isPreparingLayout = false
         }
     }
 
@@ -208,8 +288,11 @@ final class AppModel: ObservableObject {
 
     func startProcessing() {
         guard let values = validatedProcessingValues() else { return }
+        guard let layout = pendingCropSelection else {
+            alertMessage = "目标壁纸画布尚未准备完成，请重新点击“处理并替换”。"
+            return
+        }
         let loopCount = max(1, Int(ceil(values.targetDuration / values.input.duration)))
-        let layout = pendingCropSelection ?? wallpaperLayout(for: values.input)
         pendingCropSelection = nil
         showProcessConfirmation = false
         runConversion(
@@ -468,7 +551,7 @@ final class AppModel: ObservableObject {
         loopCount: Int,
         bitrate: Int,
         archiveName: String?,
-        cropSelection: WallpaperCropSelection?
+        cropSelection: WallpaperCropSelection
     ) {
         isProcessing = true
         progress = 0
@@ -492,12 +575,10 @@ final class AppModel: ObservableObject {
                 logger.write("Start input=\(input.url.path) uuid=\(uuid) duration=\(input.duration) loopCount=\(loopCount) bitrate=\(bitrate)")
                 progress = 3
 
-                let aspectDetail = cropSelection == nil
-                    ? "保持原始画幅比例。"
-                    : "已按主显示器比例裁剪并铺满，不拉伸原画面。"
+                let aspectDetail = "按屏幕可见区域取景，并生成 \(cropSelection.outputWidth) × \(cropSelection.outputHeight) 的目标 Aerial 画布。"
                 phase = .running(number: 4, title: "编码动态壁纸视频", detail: "正在生成 HEVC Main 10 输出，\(aspectDetail)")
                 let output = try processedOutputURL(uuid: uuid)
-                try await EncoderService.encode(
+                let geometryValidation = try await EncoderService.encode(
                     input: input.url,
                     output: output,
                     loopCount: loopCount,
@@ -505,9 +586,10 @@ final class AppModel: ObservableObject {
                     executable: encoder,
                     cropSelection: cropSelection
                 )
+                logger.write("Geometry validation output=\(output.path): \(geometryValidation)")
                 progress = 4
 
-                phase = .running(number: 5, title: "验证 temporal sample groups", detail: "必须同时包含 tscl 和 tsas 的四项标记。")
+                phase = .running(number: 5, title: "验证输出兼容性", detail: "画布几何已固定；继续检查 tscl 和 tsas 四项标记。")
                 let validation = try await EncoderService.validate(
                     output: output,
                     repository: encoder.deletingLastPathComponent()
@@ -588,58 +670,22 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func cropSelection(for input: InputVideoInfo) -> WallpaperCropSelection? {
-        guard let display = displayPixelSize(),
-              abs(Double(input.width) / Double(input.height) - display.aspect) > 0.005 else {
-            return nil
-        }
-        return wallpaperLayout(for: input)
+    private func requiresCrop(for input: InputVideoInfo) -> Bool {
+        guard let display = displayPixelSize() else { return false }
+        return abs(Double(input.width) / Double(input.height) - display.aspect) > 0.005
     }
 
-    private func wallpaperLayout(for input: InputVideoInfo) -> WallpaperCropSelection? {
+    private func wallpaperLayout(
+        for input: InputVideoInfo,
+        outputCanvas: AerialCanvas
+    ) -> WallpaperCropSelection? {
         guard let display = displayPixelSize() else { return nil }
-        let sourceWidth = Double(input.width)
-        let sourceHeight = Double(input.height)
-        let sourceAspect = sourceWidth / sourceHeight
-        let cropWidth: Double
-        let cropHeight: Double
-        let originX: Double
-        let originY: Double
-
-        if abs(sourceAspect - display.aspect) <= 0.005 {
-            cropWidth = sourceWidth
-            cropHeight = sourceHeight
-            originX = 0
-            originY = 0
-        } else if sourceAspect > display.aspect {
-            cropWidth = Double(max(2, Int((sourceHeight * display.aspect).rounded(.down)) & ~1))
-            cropHeight = sourceHeight
-            originX = (sourceWidth - cropWidth) / 2
-            originY = 0
-        } else if sourceAspect < display.aspect {
-            cropWidth = sourceWidth
-            cropHeight = Double(max(2, Int((sourceWidth / display.aspect).rounded(.down)) & ~1))
-            originX = 0
-            originY = (sourceHeight - cropHeight) / 2
-        } else {
-            cropWidth = sourceWidth
-            cropHeight = sourceHeight
-            originX = 0
-            originY = 0
-        }
-
-        var selection = WallpaperCropSelection(
-            sourceWidth: sourceWidth,
-            sourceHeight: sourceHeight,
-            cropWidth: cropWidth,
-            cropHeight: cropHeight,
-            outputWidth: display.width,
-            outputHeight: display.height,
-            originX: originX,
-            originY: originY
+        return WallpaperGeometry.cropSelection(
+            sourceWidth: Double(input.width),
+            sourceHeight: Double(input.height),
+            screenAspect: display.aspect,
+            outputCanvas: outputCanvas
         )
-        selection.clamp()
-        return selection
     }
 
     private func displayPixelSize() -> (width: Int, height: Int, aspect: Double)? {

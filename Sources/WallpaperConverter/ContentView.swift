@@ -4,6 +4,7 @@ import AppKit
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         TabView {
@@ -48,6 +49,11 @@ struct ContentView: View {
             Button("取消", role: .cancel) { }
         } message: {
             Text("恢复前会自动备份当前文件，并重载 WallpaperAgent。")
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                model.refreshTargets()
+            }
         }
     }
 
@@ -148,17 +154,30 @@ struct ContentView: View {
             HStack {
                 Text("已安装的动态壁纸")
                     .foregroundStyle(.secondary)
-                Picker("已安装的动态壁纸", selection: $model.selectedUUID) {
-                    Text("手动输入 UUID").tag("")
-                    ForEach(model.targets) { target in
-                        Text(target.uuid).tag(target.uuid)
+                if model.targets.isEmpty {
+                    Picker("已安装的动态壁纸", selection: .constant("")) {
+                        Text("请先下载动态壁纸").tag("")
                     }
+                    .labelsHidden()
+                    .disabled(true)
+                    Spacer()
+                    Button("打开系统设置→壁纸") {
+                        model.openWallpaperSettings()
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else {
+                    Picker("已安装的动态壁纸", selection: $model.selectedUUID) {
+                        Text("手动输入 UUID").tag("")
+                        ForEach(model.targets) { target in
+                            Text(target.uuid).tag(target.uuid)
+                        }
+                    }
+                    .labelsHidden()
+                    .onChange(of: model.selectedUUID) { value in
+                        model.selectTarget(value)
+                    }
+                    Spacer()
                 }
-                .labelsHidden()
-                .onChange(of: model.selectedUUID) { value in
-                    model.selectTarget(value)
-                }
-                Spacer()
             }
 
             HStack {
@@ -210,7 +229,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 TextField("例如：我的夜景", text: $model.archiveNameText)
                     .textFieldStyle(.roundedBorder)
-                Text("留空使用原 UUID；填写后仍会保留自动编号，例如 1-我的夜景.mov。")
+                Text("命名本次替换前保存的系统原壁纸，不会重命名刚拖入的新视频。留空使用原 UUID，并始终保留自动编号。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -334,7 +353,7 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Button(model.isProcessing ? "处理中…" : "处理并替换") {
+            Button(model.isProcessing ? "处理中…" : model.isPreparingLayout ? "读取目标画布…" : "处理并替换") {
                 model.requestProcessing()
             }
             .buttonStyle(.borderedProminent)
@@ -370,7 +389,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("WallpaperConverter · v0.6.0")
+            Text("WallpaperConverter · v0.7.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()

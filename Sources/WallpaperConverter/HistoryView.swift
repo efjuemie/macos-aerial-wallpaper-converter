@@ -12,6 +12,10 @@ struct HistoryView: View {
                 Label("正在生成缺失的首帧预览…", systemImage: "photo.badge.arrow.down")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } else if !model.previewFailures.isEmpty {
+                Label("部分预览生成失败；可点击“刷新预览”重试，详情已写入日志。", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
 
             if model.archiveEntries.isEmpty {
@@ -109,7 +113,9 @@ struct HistoryView: View {
                 ForEach(model.archiveEntries) { entry in
                     ArchiveThumbnailCard(
                         entry: entry,
-                        isSelected: model.selectedArchive?.url == entry.url
+                        isSelected: model.selectedArchive?.url == entry.url,
+                        previewFailed: model.previewFailures.contains(entry.previewURL),
+                        previewRevision: model.previewRevision
                     )
                     .onTapGesture { model.selectArchive(entry) }
                     .contextMenu {
@@ -131,7 +137,11 @@ struct HistoryView: View {
         VStack(alignment: .leading, spacing: 12) {
             Divider()
             HStack(alignment: .top, spacing: 20) {
-                ArchivePreviewImage(entry: entry)
+                ArchivePreviewImage(
+                    entry: entry,
+                    previewFailed: model.previewFailures.contains(entry.previewURL),
+                    previewRevision: model.previewRevision
+                )
                     .frame(width: 420, height: 236)
 
                 VStack(alignment: .leading, spacing: 9) {
@@ -217,11 +227,17 @@ struct HistoryView: View {
 private struct ArchiveThumbnailCard: View {
     let entry: WallpaperArchiveEntry
     let isSelected: Bool
+    let previewFailed: Bool
+    let previewRevision: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topTrailing) {
-                ArchivePreviewImage(entry: entry)
+                ArchivePreviewImage(
+                    entry: entry,
+                    previewFailed: previewFailed,
+                    previewRevision: previewRevision
+                )
                     .frame(height: 96)
                 Text(entry.kindLabel)
                     .font(.caption2)
@@ -254,10 +270,22 @@ private struct ArchiveThumbnailCard: View {
 
 private struct ArchivePreviewImage: View {
     let entry: WallpaperArchiveEntry
+    let previewFailed: Bool
+    let previewRevision: Int
+    @State private var previewData: Data?
 
     var body: some View {
         Group {
-            if let image = NSImage(contentsOf: entry.previewURL) {
+            if previewFailed {
+                VStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.title2)
+                    Text("预览生成失败，可刷新重试")
+                        .font(.caption)
+                }
+                .foregroundStyle(.orange)
+            } else if let previewData,
+                      let image = NSImage(data: previewData) {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
@@ -266,7 +294,7 @@ private struct ArchivePreviewImage: View {
                 VStack(spacing: 6) {
                     Image(systemName: "photo")
                         .font(.title2)
-                    Text("暂无预览")
+                    Text("预览暂不可用，可刷新重试")
                         .font(.caption)
                 }
                 .foregroundStyle(.secondary)
@@ -275,5 +303,15 @@ private struct ArchivePreviewImage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
         .clipped()
+        .task(id: "\(entry.previewURL.path)#\(previewRevision)#\(previewFailed)") {
+            previewData = nil
+            guard !previewFailed else { return }
+            let url = entry.previewURL
+            let data = await Task.detached(priority: .utility) {
+                PreviewService.validPreviewData(at: url)
+            }.value
+            guard !Task.isCancelled else { return }
+            previewData = data
+        }
     }
 }

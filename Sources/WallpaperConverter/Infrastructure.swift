@@ -16,7 +16,7 @@ enum AppPaths {
         isDirectory: true
     )
     static let bundledEncoderCache = appSupport.appendingPathComponent(
-        "Encoder/macos-custom-video-wallpaper-fix-bundled-v2",
+        "Encoder/macos-custom-video-wallpaper-fix-bundled-v4",
         isDirectory: true
     )
     static let processedDirectory = appSupport.appendingPathComponent(
@@ -42,7 +42,11 @@ enum AppPaths {
         "已编码",
         isDirectory: true
     )
+    static let aerialManifestURL = home.appendingPathComponent(
+        "Library/Application Support/com.apple.wallpaper/aerials/manifest/entries.json"
+    )
     static let archiveMetadataURL = archiveDirectory.appendingPathComponent("metadata.json")
+    static let nativeCanvasRecordsURL = appSupport.appendingPathComponent("native-canvases.json")
     static let legacyDesktopArchiveDirectory = home.appendingPathComponent(
         "Desktop/壁纸",
         isDirectory: true
