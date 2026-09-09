@@ -1,4 +1,3 @@
-sed: --: No such file or directory
 import AVFoundation
 import Foundation
 

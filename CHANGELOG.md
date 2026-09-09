@@ -1,4 +1,3 @@
-sed: --: No such file or directory
 # 更新记录
 
 ## 0.1.0 — 2026-09-09

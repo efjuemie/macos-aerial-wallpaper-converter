@@ -1,4 +1,3 @@
-sed: --: No such file or directory
 # Aerial Wallpaper Converter
 
 一个原生 SwiftUI macOS 应用，将短视频转换成带有 HEVC temporal sample groups 的 Aerial 兼容视频，并安全替换当前用户的 macOS 航拍动态壁纸文件。

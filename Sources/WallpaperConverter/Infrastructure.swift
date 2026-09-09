@@ -180,4 +180,3 @@ enum EnvironmentChecker {
         return (running, reasons.isEmpty ? "未发现旧自动修复脚本" : reasons.joined(separator: "；"))
     }
 }
-sed: --: No such file or directory

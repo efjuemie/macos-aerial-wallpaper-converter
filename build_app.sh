@@ -1,4 +1,3 @@
-sed: --: No such file or directory
 #!/bin/bash
 set -euo pipefail
 
