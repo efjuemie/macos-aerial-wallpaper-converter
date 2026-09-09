@@ -18,6 +18,9 @@ struct ContentView: View {
         }
         .frame(minWidth: 820, minHeight: 720)
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $model.showCropSheet) {
+            CropSheetView(model: model)
+        }
         .alert("提示", isPresented: Binding(
             get: { model.alertMessage != nil },
             set: { if !$0 { model.alertMessage = nil } }
@@ -211,7 +214,7 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text("默认目标时长为 300 秒；输出会按主显示器比例补边，不拉伸原画面。")
+            Text("默认目标时长为 300 秒；比例不一致时会先裁剪并铺满屏幕，不拉伸原画面。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -332,7 +335,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Button(model.isProcessing ? "处理中…" : "处理并替换") {
-                model.showProcessConfirmation = true
+                model.requestProcessing()
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
@@ -367,7 +370,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("WallpaperConverter · v0.4.0")
+            Text("WallpaperConverter · v0.5.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()

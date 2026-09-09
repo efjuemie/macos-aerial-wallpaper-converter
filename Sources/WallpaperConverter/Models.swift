@@ -67,9 +67,26 @@ struct WallpaperArchiveEntry: Identifiable, Hashable, Sendable {
     }
 }
 
-struct VideoCanvasSize: Hashable, Sendable {
-    let width: Int
-    let height: Int
+struct WallpaperCropSelection: Equatable, Sendable {
+    let sourceWidth: Double
+    let sourceHeight: Double
+    let cropWidth: Double
+    let cropHeight: Double
+    var originX: Double
+    var originY: Double
+
+    var outputWidth: Int {
+        max(2, Int(cropWidth.rounded(.down)) & ~1)
+    }
+
+    var outputHeight: Int {
+        max(2, Int(cropHeight.rounded(.down)) & ~1)
+    }
+
+    mutating func clamp() {
+        originX = min(max(0, originX), max(0, sourceWidth - cropWidth))
+        originY = min(max(0, originY), max(0, sourceHeight - cropHeight))
+    }
 }
 
 struct EnvironmentCheck: Identifiable, Sendable {

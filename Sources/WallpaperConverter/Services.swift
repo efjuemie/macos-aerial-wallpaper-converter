@@ -96,32 +96,32 @@ enum EncoderService {
         loopCount: Int,
         bitrateMbps: Int,
         executable: URL,
-        canvasSize: VideoCanvasSize? = nil
+        cropSelection: WallpaperCropSelection? = nil
     ) async throws {
         try AppPaths.ensureDirectory(output.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: output)
-        let aspectFitInput: URL?
-        if let canvasSize {
+        let croppedInput: URL?
+        if let cropSelection {
             let temporaryInput = output.deletingLastPathComponent().appendingPathComponent(
-                ".wallpaper-converter-aspect-\(UUID().uuidString).mov"
+                ".wallpaper-converter-crop-\(UUID().uuidString).mov"
             )
-            try await VideoAspectService.renderAspectFit(
+            try await VideoAspectService.renderCrop(
                 input: input,
                 output: temporaryInput,
-                canvasSize: canvasSize
+                crop: cropSelection
             )
-            aspectFitInput = temporaryInput
+            croppedInput = temporaryInput
         } else {
-            aspectFitInput = nil
+            croppedInput = nil
         }
         defer {
-            if let aspectFitInput {
-                try? FileManager.default.removeItem(at: aspectFitInput)
+            if let croppedInput {
+                try? FileManager.default.removeItem(at: croppedInput)
             }
         }
         let result = try await CommandRunner.run(
             executable,
-            arguments: [aspectFitInput?.path ?? input.path, output.path, String(loopCount), String(bitrateMbps)],
+            arguments: [croppedInput?.path ?? input.path, output.path, String(loopCount), String(bitrateMbps)],
             currentDirectory: executable.deletingLastPathComponent()
         )
         guard result.status == 0 else {
@@ -161,7 +161,7 @@ enum EncoderService {
 }
 
 enum VideoAspectService {
-    static func renderAspectFit(input: URL, output: URL, canvasSize: VideoCanvasSize) async throws {
+    static func renderCrop(input: URL, output: URL, crop: WallpaperCropSelection) async throws {
         let asset = AVURLAsset(url: input)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw AppError("视频中没有可用于比例处理的视频轨道。")
@@ -172,32 +172,42 @@ enum VideoAspectService {
         let transformedBounds = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
         let sourceWidth = max(1, abs(transformedBounds.width))
         let sourceHeight = max(1, abs(transformedBounds.height))
-        let scale = min(
-            CGFloat(canvasSize.width) / sourceWidth,
-            CGFloat(canvasSize.height) / sourceHeight
+        guard crop.sourceWidth <= sourceWidth + 1,
+              crop.sourceHeight <= sourceHeight + 1,
+              crop.cropWidth > 1,
+              crop.cropHeight > 1,
+              crop.originX >= 0,
+              crop.originY >= 0,
+              crop.originX + crop.cropWidth <= sourceWidth + 1,
+              crop.originY + crop.cropHeight <= sourceHeight + 1 else {
+            throw AppError("视频裁剪范围无效，无法生成动态壁纸。")
+        }
+
+        let normalizedTransform = CGAffineTransform(
+            a: preferredTransform.a,
+            b: preferredTransform.b,
+            c: preferredTransform.c,
+            d: preferredTransform.d,
+            tx: preferredTransform.tx - transformedBounds.minX,
+            ty: preferredTransform.ty - transformedBounds.minY
         )
-        let fittedWidth = sourceWidth * scale
-        let fittedHeight = sourceHeight * scale
-        let paddingX = (CGFloat(canvasSize.width) - fittedWidth) / 2
-        let paddingY = (CGFloat(canvasSize.height) - fittedHeight) / 2
         let transform = CGAffineTransform(
-            a: preferredTransform.a * scale,
-            b: preferredTransform.b * scale,
-            c: preferredTransform.c * scale,
-            d: preferredTransform.d * scale,
-            tx: preferredTransform.tx * scale - transformedBounds.minX * scale + paddingX,
-            ty: preferredTransform.ty * scale - transformedBounds.minY * scale + paddingY
+            a: normalizedTransform.a,
+            b: normalizedTransform.b,
+            c: normalizedTransform.c,
+            d: normalizedTransform.d,
+            tx: normalizedTransform.tx - crop.originX,
+            ty: normalizedTransform.ty - crop.originY
         )
 
         let videoComposition = AVMutableVideoComposition()
-        videoComposition.renderSize = CGSize(width: canvasSize.width, height: canvasSize.height)
+        videoComposition.renderSize = CGSize(width: crop.outputWidth, height: crop.outputHeight)
         let frameRate = try await track.load(.nominalFrameRate)
         let timescale = Int32(max(1, Int(frameRate.rounded())))
         videoComposition.frameDuration = CMTime(value: 1, timescale: timescale)
 
         let instruction = AVMutableVideoCompositionInstruction()
         instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
-        instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
         let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
         layerInstruction.setTransform(transform, at: .zero)
         instruction.layerInstructions = [layerInstruction]
@@ -234,6 +244,12 @@ enum VideoAspectService {
 
 enum PreviewService {
     static func generateFirstFrame(from video: URL, to destination: URL) async throws {
+        let data = try await firstFrameJPEG(from: video)
+        try AppPaths.ensureDirectory(destination.deletingLastPathComponent())
+        try data.write(to: destination, options: [.atomic])
+    }
+
+    static func firstFrameJPEG(from video: URL) async throws -> Data {
         let asset = AVAsset(url: video)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -246,8 +262,7 @@ enum PreviewService {
         ) else {
             throw AppError("无法生成动态壁纸首帧预览。")
         }
-        try AppPaths.ensureDirectory(destination.deletingLastPathComponent())
-        try data.write(to: destination, options: [.atomic])
+        return data
     }
 }
 

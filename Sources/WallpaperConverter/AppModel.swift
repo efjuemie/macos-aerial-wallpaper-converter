@@ -32,6 +32,8 @@ final class AppModel: ObservableObject {
     @Published var isProcessing = false
     @Published var isInspectingVideo = false
     @Published var archiveNameText = ""
+    @Published var pendingCropSelection: WallpaperCropSelection?
+    @Published var showCropSheet = false
 
     private let logger = AppLogger()
     private var previewTask: Task<Void, Never>?
@@ -120,6 +122,8 @@ final class AppModel: ObservableObject {
         guard !isProcessing else { return }
         inputPath = url.path
         inputInfo = nil
+        pendingCropSelection = nil
+        showCropSheet = false
         alertMessage = nil
         isInspectingVideo = true
 
@@ -165,39 +169,93 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func requestProcessing() {
+        guard let values = validatedProcessingValues() else { return }
+        if let selection = cropSelection(for: values.input) {
+            pendingCropSelection = selection
+            showCropSheet = true
+        } else {
+            pendingCropSelection = nil
+            showProcessConfirmation = true
+        }
+    }
+
+    func continueWithCropSelection() {
+        guard var selection = pendingCropSelection else {
+            showCropSheet = false
+            showProcessConfirmation = true
+            return
+        }
+        selection.clamp()
+        pendingCropSelection = selection
+        showCropSheet = false
+        showProcessConfirmation = true
+    }
+
+    func cancelCropSelection() {
+        pendingCropSelection = nil
+        showCropSheet = false
+    }
+
+    func updatePendingCrop(originX: Double, originY: Double) {
+        guard var selection = pendingCropSelection else { return }
+        selection.originX = originX
+        selection.originY = originY
+        selection.clamp()
+        pendingCropSelection = selection
+    }
+
     func startProcessing() {
+        guard let values = validatedProcessingValues() else { return }
+        let loopCount = max(1, Int(ceil(values.targetDuration / values.input.duration)))
+        let cropSelection = pendingCropSelection
+        pendingCropSelection = nil
+        showProcessConfirmation = false
+        runConversion(
+            input: values.input,
+            uuid: values.uuid,
+            loopCount: loopCount,
+            bitrate: values.bitrate,
+            archiveName: values.archiveName,
+            cropSelection: cropSelection
+        )
+    }
+
+    private func validatedProcessingValues() -> (
+        input: InputVideoInfo,
+        uuid: String,
+        bitrate: Int,
+        targetDuration: Double,
+        archiveName: String?
+    )? {
         guard let inputInfo,
               let uuid = AerialService.normalizeUUID(uuidText) else {
             alertMessage = "请先选择视频，并输入有效的 Aerial UUID。"
-            return
+            return nil
         }
         guard let bitrate = Int(bitrateText), (1...100).contains(bitrate) else {
             alertMessage = "输出码率必须是 1–100 Mbps 之间的整数。"
-            return
+            return nil
         }
         guard let targetDuration = Double(targetDurationText), targetDuration >= 1 else {
             alertMessage = "目标时长必须是大于 0 的数字。"
-            return
+            return nil
         }
         guard targetDuration <= 3600 else {
             alertMessage = "目标时长不能超过 3600 秒。"
-            return
+            return nil
         }
         let archiveName = archiveNameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !archiveName.contains("/") && !archiveName.contains("\\") else {
             alertMessage = "自定义归档名称不能包含路径分隔符。"
-            return
+            return nil
         }
-        let loopCount = max(1, Int(ceil(targetDuration / inputInfo.duration)))
-        let canvasSize = aspectFitCanvasSize(for: inputInfo)
-        showProcessConfirmation = false
-        runConversion(
+        return (
             input: inputInfo,
             uuid: uuid,
-            loopCount: loopCount,
             bitrate: bitrate,
-            archiveName: archiveName.isEmpty ? nil : archiveName,
-            canvasSize: canvasSize
+            targetDuration: targetDuration,
+            archiveName: archiveName.isEmpty ? nil : archiveName
         )
     }
 
@@ -408,7 +466,7 @@ final class AppModel: ObservableObject {
         loopCount: Int,
         bitrate: Int,
         archiveName: String?,
-        canvasSize: VideoCanvasSize?
+        cropSelection: WallpaperCropSelection?
     ) {
         isProcessing = true
         progress = 0
@@ -432,7 +490,9 @@ final class AppModel: ObservableObject {
                 logger.write("Start input=\(input.url.path) uuid=\(uuid) duration=\(input.duration) loopCount=\(loopCount) bitrate=\(bitrate)")
                 progress = 3
 
-                let aspectDetail = canvasSize == nil ? "保持原始画幅比例。" : "按主显示器比例补边，不拉伸原画面。"
+                let aspectDetail = cropSelection == nil
+                    ? "保持原始画幅比例。"
+                    : "已按主显示器比例裁剪并铺满，不拉伸原画面。"
                 phase = .running(number: 4, title: "编码动态壁纸视频", detail: "正在生成 HEVC Main 10 输出，\(aspectDetail)")
                 let output = try processedOutputURL(uuid: uuid)
                 try await EncoderService.encode(
@@ -441,7 +501,7 @@ final class AppModel: ObservableObject {
                     loopCount: loopCount,
                     bitrateMbps: bitrate,
                     executable: encoder,
-                    canvasSize: canvasSize
+                    cropSelection: cropSelection
                 )
                 progress = 4
 
@@ -518,7 +578,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func aspectFitCanvasSize(for input: InputVideoInfo) -> VideoCanvasSize? {
+    private func cropSelection(for input: InputVideoInfo) -> WallpaperCropSelection? {
         guard let screenSize = NSScreen.main?.frame.size,
               screenSize.width > 0,
               screenSize.height > 0 else {
@@ -528,26 +588,34 @@ final class AppModel: ObservableObject {
         let screenAspect = screenSize.width / screenSize.height
         guard abs(sourceAspect - screenAspect) > 0.005 else { return nil }
 
-        var width: Double
-        var height: Double
-        if sourceAspect < screenAspect {
-            height = Double(input.height)
-            width = height * screenAspect
+        let sourceWidth = Double(input.width)
+        let sourceHeight = Double(input.height)
+        let cropWidth: Double
+        let cropHeight: Double
+        let originX: Double
+        let originY: Double
+        if sourceAspect > screenAspect {
+            cropWidth = Double(max(2, Int((sourceHeight * screenAspect).rounded(.down)) & ~1))
+            cropHeight = sourceHeight
+            originX = (sourceWidth - cropWidth) / 2
+            originY = 0
         } else {
-            width = Double(input.width)
-            height = width / screenAspect
+            cropWidth = sourceWidth
+            cropHeight = Double(max(2, Int((sourceWidth / screenAspect).rounded(.down)) & ~1))
+            originX = 0
+            originY = (sourceHeight - cropHeight) / 2
         }
 
-        let maximumDimension = 3840.0
-        if max(width, height) > maximumDimension {
-            let scale = maximumDimension / max(width, height)
-            width *= scale
-            height *= scale
-        }
-
-        let evenWidth = max(2, Int(width.rounded()) & ~1)
-        let evenHeight = max(2, Int(height.rounded()) & ~1)
-        return VideoCanvasSize(width: evenWidth, height: evenHeight)
+        var selection = WallpaperCropSelection(
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            cropWidth: cropWidth,
+            cropHeight: cropHeight,
+            originX: originX,
+            originY: originY
+        )
+        selection.clamp()
+        return selection
     }
 
     private func processedOutputURL(uuid: String) throws -> URL {
