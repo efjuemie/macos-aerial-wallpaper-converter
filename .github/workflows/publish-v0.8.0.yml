@@ -1,0 +1,134 @@
+name: Publish v0.8.0
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-v0.8.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # This workflow remains in the repository for auditability, but only the
+    # release automation commit can run the publishing job. The guard makes
+    # reruns safe: an existing release or matching tag is reused; conflicts stop.
+    if: >-
+      github.event.head_commit != null &&
+      startsWith(github.event.head_commit.message, 'Automate v0.8.0 GitHub release')
+    runs-on: macos-14
+    steps:
+      - name: Guard existing release and tag
+        id: release_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_error="$(mktemp)"
+          if gh release view v0.8.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$release_error"; then
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            echo "v0.8.0 release already exists; leaving it unchanged."
+            exit 0
+          elif ! grep -Eq 'HTTP 404|release not found' "$release_error"; then
+            cat "$release_error" >&2
+            exit 1
+          fi
+
+          tag_error="$(mktemp)"
+          if tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v0.8.0" --jq '.object.type + "\t" + .object.sha' 2>"$tag_error")"; then
+            IFS=$'\t' read -r tag_type tag_object_sha <<< "$tag_ref"
+            case "$tag_type" in
+              commit)
+                tag_target_sha="$tag_object_sha"
+                ;;
+              tag)
+                tag_target="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" --jq '.object.type + "\t" + .object.sha')"
+                IFS=$'\t' read -r dereferenced_type tag_target_sha <<< "$tag_target"
+                if [ "$dereferenced_type" != "commit" ]; then
+                  echo "v0.8.0 tag does not dereference to a commit; refusing to overwrite it." >&2
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "v0.8.0 tag has an unsupported target type: $tag_type" >&2
+                exit 1
+                ;;
+            esac
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+            if [ "$tag_target_sha" = "$GITHUB_SHA" ]; then
+              echo "tag_matches=true" >> "$GITHUB_OUTPUT"
+              echo "v0.8.0 tag already points to this release commit; leaving it unchanged."
+            else
+              echo "tag_conflict=true" >> "$GITHUB_OUTPUT"
+              echo "v0.8.0 tag points to $tag_target_sha, not $GITHUB_SHA; refusing to overwrite it."
+            fi
+          elif grep -q 'HTTP 404' "$tag_error"; then
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$tag_error" >&2
+            exit 1
+          fi
+
+      - name: Stop on an existing tag pointing elsewhere
+        if: steps.release_state.outputs.tag_conflict == 'true'
+        shell: bash
+        run: |
+          echo "v0.8.0 already points to another commit; manual review is required." >&2
+          exit 1
+
+      - name: Check out release commit
+        if: steps.release_state.outputs.release_exists != 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Build arm64 app
+        if: steps.release_state.outputs.release_exists != 'true'
+        shell: bash
+        run: ./build_app.sh
+
+      - name: Package and verify release artifacts
+        if: steps.release_state.outputs.release_exists != 'true'
+        shell: bash
+        run: Scripts/package_release.sh
+
+      - name: Create annotated tag
+        if: steps.release_state.outputs.release_exists != 'true' && steps.release_state.outputs.tag_exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a v0.8.0 "$GITHUB_SHA" -m "Release v0.8.0"
+          git push origin refs/tags/v0.8.0
+
+      - name: Create GitHub Release and upload artifacts
+        if: steps.release_state.outputs.release_exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          awk '
+            /^## 0\.8\.0/ { in_section = 1; next }
+            in_section && /^## / { exit }
+            in_section { print }
+          ' CHANGELOG.md > "$notes_file"
+          printf '\n%s\n' '运行要求：macOS 13 或更高版本、Apple Silicon（arm64）、至少一个已下载的 Apple 动态壁纸和 1.5 GB 可用磁盘空间。此包使用 ad-hoc 签名，当前未配置 Developer ID 签名或 Apple 公证。' >> "$notes_file"
+          gh release create v0.8.0 \
+            "dist/releases/Aerial-Wallpaper-Converter-v0.8.0-Apple-Silicon.dmg" \
+            "dist/releases/Aerial-Wallpaper-Converter-v0.8.0-Apple-Silicon.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Aerial Wallpaper Converter v0.8.0" \
+            --notes-file "$notes_file" \
+            --latest

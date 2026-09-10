@@ -6,7 +6,7 @@
 
 ### 普通用户（推荐）
 
-普通用户无需 clone 源码。当前仓库正在准备首个 `0.8.0` 发行包，GitHub Releases 暂无可下载附件；发行包完成并发布后，请从本仓库的 [Releases](https://github.com/efjuemie/macos-aerial-wallpaper-converter/releases) 页面下载与设备匹配的 Apple Silicon DMG 或 ZIP。
+普通用户无需 clone 源码。正式发行包发布在本仓库的 [Releases](https://github.com/efjuemie/macos-aerial-wallpaper-converter/releases) 页面，请下载与设备匹配的 Apple Silicon DMG 或 ZIP。
 
 安装步骤：
 

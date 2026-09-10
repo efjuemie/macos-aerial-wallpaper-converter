@@ -6,7 +6,7 @@
 - 将 temporal sample group 验证移植为原生 Swift，支持 32 位、64 位扩展和 size==0 的 BMFF box；普通运行不再调用 Python 3，并在验证失败时阻止安装。
 - 重做运行环境检查，区分 required/optional、状态、稳定 ID、阻塞逻辑和快速修复操作；增加 macOS、Apple Silicon、内置 encoder、已下载动态壁纸、磁盘空间和旧 LaunchAgent 检查。
 - 新增 Debug 环境缺失模拟、内置 encoder 完整性测试、temporal validator 测试和发行打包脚本；版本号与 Bundle Identifier 更新为 0.8.0 / build 8 和 `io.github.efjuemie.WallpaperConverter`。
-- 补充普通用户 Releases 安装、环境修复、开发者构建、数据位置、安全和常见问题说明；当前 GitHub Releases 尚无已发布附件。
+- 补充普通用户 Releases 安装、环境修复、开发者构建、数据位置、安全和常见问题说明。
 
 ## 0.7.0 — 2026-09-10
 

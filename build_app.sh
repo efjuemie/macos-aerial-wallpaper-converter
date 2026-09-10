@@ -9,7 +9,8 @@ ENCODER_STAGE="$BUILD_DIR/encoder-staging"
 SWIFTC="${SWIFTC:-swiftc}"
 
 cd "$PROJECT_DIR"
-swift build -c release
+swift build -c release --arch arm64
+RELEASE_BIN_PATH="$(swift build --show-bin-path -c release --arch arm64)"
 
 rm -rf "$ENCODER_STAGE"
 mkdir -p "$ENCODER_STAGE"
@@ -36,7 +37,7 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" \
   "$APP_BUNDLE/Contents/Resources/Encoder/bin" \
   "$APP_BUNDLE/Contents/Resources/Encoder/source"
-cp "$BUILD_DIR/release/WallpaperConverter" "$APP_BUNDLE/Contents/MacOS/WallpaperConverter"
+cp "$RELEASE_BIN_PATH/WallpaperConverter" "$APP_BUNDLE/Contents/MacOS/WallpaperConverter"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 cp "$PROJECT_DIR/Resources/AppLogo.png" "$APP_BUNDLE/Contents/Resources/AppLogo.png"
 cp "$ENCODER_STAGE/encode_temporal" \
