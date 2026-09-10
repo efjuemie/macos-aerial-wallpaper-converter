@@ -18,8 +18,7 @@ final class AppModel: ObservableObject {
     @Published var targets: [AerialTarget] = []
     @Published var bitrateText = "12"
     @Published var targetDurationText = "300"
-    @Published var environmentChecks: [EnvironmentCheck] = []
-    @Published var oldAgentWarning: String?
+    @Published var environmentChecks: [EnvironmentCheck] = EnvironmentCheckBuilder.checking()
     @Published var phase: ProcessingPhase = .idle
     @Published var progress = 0
     @Published var lastReport: OperationReport?
@@ -43,9 +42,12 @@ final class AppModel: ObservableObject {
     @Published var archiveNameText = ""
     @Published var pendingCropSelection: WallpaperCropSelection?
     @Published var showCropSheet = false
+    @Published var showEnvironmentActionConfirmation = false
 
     private let logger = AppLogger()
     private var previewTask: Task<Void, Never>?
+    private var environmentRefreshTask: Task<Void, Never>?
+    private var pendingEnvironmentAction: EnvironmentAction?
 
     init() {
         refresh()
@@ -54,13 +56,31 @@ final class AppModel: ObservableObject {
         }
     }
 
+    var hasBlockingEnvironmentFailure: Bool {
+        environmentChecks.contains(where: \.blocksProcessing)
+    }
+
     var hasEnvironmentFailure: Bool {
-        environmentChecks.contains { !$0.isOK }
+        hasBlockingEnvironmentFailure
+    }
+
+    var isEnvironmentChecking: Bool {
+        environmentChecks.isEmpty || environmentChecks.contains { $0.status == .checking }
+    }
+
+    var environmentBlockReason: String? {
+        let failures = environmentChecks.filter(\.blocksProcessing)
+        guard !failures.isEmpty else {
+            return isEnvironmentChecking ? "正在检查运行环境…" : nil
+        }
+        return "请先处理：" + failures.map(\.name).joined(separator: "、")
     }
 
     var canStart: Bool {
         inputInfo != nil
             && selectedTargetExists
+            && !hasBlockingEnvironmentFailure
+            && !isEnvironmentChecking
             && !isProcessing
             && !isInspectingVideo
             && !isPreparingLayout
@@ -72,13 +92,18 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() {
-        Task {
-            refreshTargets()
-            environmentChecks = await EnvironmentChecker.check()
-            let status = await EnvironmentChecker.oldLaunchAgentStatus()
-            oldAgentWarning = status.isRunning ? status.detail : nil
+        environmentRefreshTask?.cancel()
+        environmentChecks = EnvironmentCheckBuilder.checking()
+        environmentRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let checks = await EnvironmentChecker.check()
+            guard !Task.isCancelled else { return }
+            self.environmentChecks = checks
         }
-        refreshArchives()
+        refreshTargets()
+        if ArchiveRefreshPolicy.shouldRefreshArchives(isProcessing: isProcessing) {
+            refreshArchives()
+        }
     }
 
     func refreshTargets() {
@@ -87,20 +112,32 @@ final class AppModel: ObservableObject {
     }
 
     func refreshArchives() {
+        guard ArchiveRefreshPolicy.shouldRefreshArchives(isProcessing: isProcessing) else {
+            return
+        }
         let previousTask = previewTask
         previousTask?.cancel()
         isGeneratingPreviews = true
         previewTask = Task { @MainActor [weak self] in
             await previousTask?.value
             guard !Task.isCancelled else { return }
-            await Task.detached(priority: .utility) {
-                AerialService.migrateLegacyDesktopArchives()
-                AerialService.migrateProcessedOutputs()
-            }.value
-            guard let self, !Task.isCancelled else { return }
+            guard let self, !self.isProcessing else {
+                self?.isGeneratingPreviews = false
+                return
+            }
+            AerialService.migrateLegacyDesktopArchives()
+            AerialService.migrateProcessedOutputs()
+            guard !Task.isCancelled, !self.isProcessing else {
+                if self.isProcessing { self.isGeneratingPreviews = false }
+                return
+            }
             let entries = await Task.detached(priority: .utility) {
                 AerialService.archiveEntries()
             }.value
+            guard !Task.isCancelled, !self.isProcessing else {
+                if self.isProcessing { self.isGeneratingPreviews = false }
+                return
+            }
             self.archiveEntries = entries
             let currentPreviewURLs = Set(entries.map(\.previewURL))
             self.previewFailures.formIntersection(currentPreviewURLs)
@@ -114,6 +151,10 @@ final class AppModel: ObservableObject {
             }
             for entry in entries {
                 guard !Task.isCancelled else { return }
+                guard !self.isProcessing else {
+                    self.isGeneratingPreviews = false
+                    return
+                }
                 let result = await Task.detached(priority: .utility) {
                     () async -> PreviewRefreshResult in
                     if PreviewService.isValidPreview(at: entry.previewURL) {
@@ -130,6 +171,10 @@ final class AppModel: ObservableObject {
                     }
                 }.value
                 guard !Task.isCancelled else { return }
+                guard !self.isProcessing else {
+                    self.isGeneratingPreviews = false
+                    return
+                }
                 switch result {
                 case .valid:
                     self.previewFailures.remove(entry.previewURL)
@@ -142,9 +187,17 @@ final class AppModel: ObservableObject {
                 }
             }
             guard !Task.isCancelled else { return }
+            guard !self.isProcessing else {
+                self.isGeneratingPreviews = false
+                return
+            }
             self.archiveEntries = await Task.detached(priority: .utility) {
                 AerialService.archiveEntries()
             }.value
+            guard !Task.isCancelled, !self.isProcessing else {
+                if self.isProcessing { self.isGeneratingPreviews = false }
+                return
+            }
             if let selectedArchive = self.selectedArchive {
                 self.selectedArchive = self.archiveEntries.first { $0.url == selectedArchive.url }
             }
@@ -348,6 +401,58 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func performEnvironmentAction(_ action: EnvironmentAction) {
+        guard action != .none else { return }
+        if action.requiresConfirmation {
+            pendingEnvironmentAction = action
+            showEnvironmentActionConfirmation = true
+            return
+        }
+        executeEnvironmentAction(action)
+    }
+
+    func confirmEnvironmentAction() {
+        showEnvironmentActionConfirmation = false
+        guard let action = pendingEnvironmentAction else { return }
+        pendingEnvironmentAction = nil
+        executeEnvironmentAction(action)
+    }
+
+    func cancelEnvironmentAction() {
+        pendingEnvironmentAction = nil
+        showEnvironmentActionConfirmation = false
+    }
+
+    var environmentActionConfirmationMessage: String {
+        switch pendingEnvironmentAction {
+        case .installCommandLineTools:
+            return "将调用 macOS 官方 Command Line Tools 安装器。应用不会获取管理员密码，也不会修改系统保护设置。"
+        case .disableOldLaunchAgent:
+            return "将卸载精确的旧 LaunchAgent 服务并安全保留其配置，不会删除动态壁纸或应用备份。"
+        default:
+            return ""
+        }
+    }
+
+    private func executeEnvironmentAction(_ action: EnvironmentAction) {
+        switch action {
+        case .refresh:
+            refresh()
+        case .disableOldLaunchAgent:
+            disableOldAgent()
+        default:
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let message = await EnvironmentRepairService.perform(action) {
+                    self.alertMessage = message
+                }
+                if action == .installCommandLineTools {
+                    self.refresh()
+                }
+            }
+        }
+    }
+
     func openArchiveFolder() {
         do {
             try AppPaths.ensureDirectory(AppPaths.archiveDirectory)
@@ -472,33 +577,38 @@ final class AppModel: ObservableObject {
         Task {
             var messages: [String] = []
             let uid = String(getuid())
+            let launchAgentLabel = "gui/\(uid)/com.local.wallpaper-aerial-fix"
             if let launchctl = CommandRunner.executable(named: "launchctl") {
                 let result = try? await CommandRunner.run(
                     launchctl,
-                    arguments: ["bootout", "gui/\(uid)", AppPaths.oldLaunchAgent.path]
+                    arguments: ["bootout", launchAgentLabel]
                 )
-                if result?.status != 0, let output = result?.output, !output.isEmpty {
-                    messages.append(output.trimmingCharacters(in: .whitespacesAndNewlines))
+                if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path),
+                   result?.status != 0,
+                   let output = result?.output.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !output.isEmpty {
+                    messages.append("无法卸载旧 LaunchAgent：\(output)")
                 }
+            } else if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path) {
+                messages.append("未找到 launchctl，无法卸载旧 LaunchAgent 服务。")
             }
             if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path) {
                 do {
-                    if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgentDisabled.path) {
-                        try FileManager.default.removeItem(at: AppPaths.oldLaunchAgentDisabled)
+                    let destination = LaunchAgentPathPolicy.nextAvailableDestination(
+                        preferred: AppPaths.oldLaunchAgentDisabled
+                    )
+                    try FileManager.default.moveItem(at: AppPaths.oldLaunchAgent, to: destination)
+                    if destination != AppPaths.oldLaunchAgentDisabled {
+                        messages.append(
+                            "已保留现有 \(AppPaths.oldLaunchAgentDisabled.lastPathComponent)，旧配置已安全保存为 \(destination.lastPathComponent)。"
+                        )
                     }
-                    try FileManager.default.moveItem(at: AppPaths.oldLaunchAgent, to: AppPaths.oldLaunchAgentDisabled)
                 } catch {
-                    messages.append("无法将旧 LaunchAgent 改名为 .disabled：\(error.localizedDescription)")
+                    messages.append("无法安全保存旧 LaunchAgent 配置：\(error.localizedDescription)")
                 }
             }
-            if let pgrep = CommandRunner.executable(named: "pgrep"),
-               let running = try? await CommandRunner.run(pgrep, arguments: ["-fl", "wallpaper-aerial-fix"]),
-               running.status == 0,
-               let pkill = CommandRunner.executable(named: "pkill") {
-                _ = try? await CommandRunner.run(pkill, arguments: ["-f", "wallpaper-aerial-fix"])
-            }
-            oldAgentWarning = messages.isEmpty ? nil : messages.joined(separator: "\n")
             logger.write("Disabled old LaunchAgent; result=\(messages.joined(separator: " | "))")
+            refresh()
         }
     }
 
@@ -553,21 +663,35 @@ final class AppModel: ObservableObject {
         archiveName: String?,
         cropSelection: WallpaperCropSelection
     ) {
+        previewTask?.cancel()
+        previewTask = nil
+        isGeneratingPreviews = false
+        environmentRefreshTask?.cancel()
         isProcessing = true
         progress = 0
-        phase = .running(number: 1, title: "检查开发环境", detail: "正在检查 Swift、Git、Python 3 和动态壁纸目录…")
+        phase = .running(
+            number: 1,
+            title: "检查运行环境",
+            detail: "正在检查系统版本、内置编码器、动态壁纸目录和磁盘空间…"
+        )
         lastReport = nil
 
+        var didComplete = false
         Task {
             do {
-                environmentChecks = await EnvironmentChecker.check()
-                guard !environmentChecks.contains(where: { !$0.isOK }) else {
-                    throw AppError(environmentChecks.filter { !$0.isOK }.map { "\($0.name)：\($0.detail)" }.joined(separator: "\n"))
+                let checks = await EnvironmentChecker.check()
+                guard !Task.isCancelled else {
+                    isProcessing = false
+                    return
+                }
+                environmentChecks = checks
+                guard !checks.contains(where: \.blocksProcessing) else {
+                    throw AppError(checks.filter(\.blocksProcessing).map { "\($0.name)：\($0.detail)" }.joined(separator: "\n"))
                 }
                 progress = 1
 
                 try checkFreeSpace()
-                phase = .running(number: 2, title: "准备编码器", detail: "首次使用会下载并编译 VideoToolbox 编码器；以后会复用本地版本。")
+                phase = .running(number: 2, title: "准备内置编码器", detail: "正在验证并准备应用内置 VideoToolbox 编码器…")
                 let encoder = try await EncoderService.prepare()
                 progress = 2
 
@@ -590,10 +714,7 @@ final class AppModel: ObservableObject {
                 progress = 4
 
                 phase = .running(number: 5, title: "验证输出兼容性", detail: "画布几何已固定；继续检查 tscl 和 tsas 四项标记。")
-                let validation = try await EncoderService.validate(
-                    output: output,
-                    repository: encoder.deletingLastPathComponent()
-                )
+                let validation = try await EncoderService.validate(output: output)
                 logger.write("Validation output=\(validation.replacingOccurrences(of: "\n", with: " | "))")
                 progress = 5
 
@@ -651,7 +772,7 @@ final class AppModel: ObservableObject {
                 phase = .success
                 backups = AerialService.backups(for: uuid)
                 targets = AerialService.targets()
-                refreshArchives()
+                didComplete = true
                 logger.write("Success uuid=\(uuid) archive=\(archive.path) backup=\(backup.path) output=\(historyOutput.path) reloadWarning=\(reloadWarning ?? "none")")
             } catch {
                 phase = .failed(error.localizedDescription)
@@ -659,6 +780,9 @@ final class AppModel: ObservableObject {
                 logger.write("Failure: \(error.localizedDescription)")
             }
             isProcessing = false
+            if didComplete {
+                refreshArchives()
+            }
         }
     }
 

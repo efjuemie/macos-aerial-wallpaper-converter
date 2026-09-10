@@ -13,82 +13,37 @@ private final class ExportSessionBox: @unchecked Sendable {
 }
 
 enum EncoderService {
-    static let repositoryURL = "https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix.git"
-
     static func prepare() async throws -> URL {
-        if let bundledRepository = AppPaths.bundledEncoderRepository {
-            return try await prepareBundled(repository: bundledRepository)
-        }
-        return try await prepareFromNetwork()
+        let encoder = try await validatedBundledEncoder()
+        return encoder.url
     }
 
-    private static func prepareBundled(repository: URL) async throws -> URL {
-        let fileManager = FileManager.default
-        try AppPaths.ensureDirectory(AppPaths.bundledEncoderCache)
-        for filename in ["encode_temporal.swift", "groups.py", "build.sh", "LICENSE"] {
-            let source = repository.appendingPathComponent(filename)
-            let destination = AppPaths.bundledEncoderCache.appendingPathComponent(filename)
-            guard fileManager.fileExists(atPath: source.path) else { continue }
-            if !fileManager.fileExists(atPath: destination.path) {
-                try fileManager.copyItem(at: source, to: destination)
-            }
-        }
-
-        let executable = AppPaths.bundledEncoderCache.appendingPathComponent("encode_temporal")
-        if !fileManager.isExecutableFile(atPath: executable.path) {
-            let buildScript = AppPaths.bundledEncoderCache.appendingPathComponent("build.sh")
-            guard fileManager.fileExists(atPath: buildScript.path) else {
-                throw AppError("应用内置编码器缺少 build.sh，无法继续。")
-            }
-            let result = try await CommandRunner.run(
-                URL(fileURLWithPath: "/bin/bash"),
-                arguments: [buildScript.path],
-                currentDirectory: AppPaths.bundledEncoderCache
-            )
-            guard result.status == 0 else {
-                throw AppError("内置编码器编译失败：\n\(result.output)")
-            }
-        }
-        guard fileManager.isExecutableFile(atPath: executable.path) else {
-            throw AppError("内置编码器编译完成后没有生成 encode_temporal。")
-        }
-        return executable
+    static func describeBundledEncoder() async throws -> String {
+        try await validatedBundledEncoder().detail
     }
 
-    private static func prepareFromNetwork() async throws -> URL {
-        let fileManager = FileManager.default
-        try AppPaths.ensureDirectory(AppPaths.encoderRepository.deletingLastPathComponent())
-
-        if !fileManager.fileExists(atPath: AppPaths.encoderRepository.path) {
-            guard let git = CommandRunner.executable(named: "git") else {
-                throw AppError("未找到 Git，无法准备编码器。")
-            }
-            let result = try await CommandRunner.run(
-                git,
-                arguments: ["clone", repositoryURL, AppPaths.encoderRepository.path]
-            )
-            guard result.status == 0 else {
-                throw AppError("应用内置编码器不可用，且在线备用下载失败：\n\(result.output)")
-            }
+    private static func validatedBundledEncoder() async throws -> (url: URL, detail: String) {
+        guard let binary = AppPaths.bundledEncoderBinary,
+              let manifest = AppPaths.bundledEncoderManifest else {
+            throw AppError("应用内置编码器资源缺失，请重新下载应用。")
         }
-
-        let executable = AppPaths.encoderRepository.appendingPathComponent("encode_temporal")
-        if !fileManager.isExecutableFile(atPath: executable.path) {
-            let buildScript = AppPaths.encoderRepository.appendingPathComponent("build.sh")
-            guard fileManager.fileExists(atPath: buildScript.path) else {
-                throw AppError("编码器目录缺少 build.sh，未自动删除现有目录。")
-            }
-            let bash = URL(fileURLWithPath: "/bin/bash")
-            let result = try await CommandRunner.run(bash, arguments: [buildScript.path], currentDirectory: AppPaths.encoderRepository)
-            guard result.status == 0 else {
-                throw AppError("编码器编译失败：\n\(result.output)")
-            }
+        guard FileManager.default.isExecutableFile(atPath: binary.path) else {
+            throw AppError("应用内置编码器缺失或不可执行，请重新下载应用。")
         }
-
-        guard fileManager.isExecutableFile(atPath: executable.path) else {
-            throw AppError("编码器编译完成后没有生成 encode_temporal。")
+        let architecture: String
+        do {
+            architecture = try EncoderArchitectureDetector.architecture(of: binary)
+        } catch let error as AppError {
+            throw error
+        } catch {
+            throw AppError("应用内置编码器无法读取，请重新下载应用。")
         }
-        return executable
+        let detail = try EncoderAssetValidator.validate(
+            binaryURL: binary,
+            manifestURL: manifest,
+            actualArchitecture: architecture
+        )
+        return (binary, detail)
     }
 
     static func encode(
@@ -130,30 +85,9 @@ enum EncoderService {
         )
     }
 
-    static func validate(output: URL, repository: URL) async throws -> String {
-        guard let python = CommandRunner.executable(named: "python3") else {
-            throw AppError("未找到 Python 3，无法验证 temporal sample groups。")
-        }
-        let groups = repository.appendingPathComponent("groups.py")
-        guard FileManager.default.fileExists(atPath: groups.path) else {
-            throw AppError("编码器仓库缺少 groups.py，无法进行安全验证。")
-        }
-        let result = try await CommandRunner.run(python, arguments: [groups.path, output.path])
-        guard result.status == 0 else {
-            throw AppError("sample group 验证程序失败：\n\(result.output)")
-        }
-
-        let required = [
-            "[sgpd] grouping_type='tscl'",
-            "[sgpd] grouping_type='tsas'",
-            "[csgm] grouping_type='tscl'",
-            "[csgm] grouping_type='tsas'"
-        ]
-        let missing = required.filter { !result.output.contains($0) }
-        guard missing.isEmpty else {
-            throw AppError("视频未通过 Aerial 兼容性验证，缺少：\n\(missing.joined(separator: "\n"))\n\n原始验证输出：\n\(result.output)")
-        }
-        return result.output
+    static func validate(output: URL) async throws -> String {
+        try Task.checkCancellation()
+        return try TemporalSampleGroupValidator.validate(at: output)
     }
 }
 

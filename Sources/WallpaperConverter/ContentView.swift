@@ -50,9 +50,19 @@ struct ContentView: View {
         } message: {
             Text("恢复前会自动备份当前文件，并重载 WallpaperAgent。")
         }
+        .confirmationDialog(
+            "确认环境操作？",
+            isPresented: $model.showEnvironmentActionConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("继续") { model.confirmEnvironmentAction() }
+            Button("取消", role: .cancel) { model.cancelEnvironmentAction() }
+        } message: {
+            Text(model.environmentActionConfirmationMessage)
+        }
         .onChange(of: scenePhase) { phase in
             if phase == .active {
-                model.refreshTargets()
+                model.refresh()
             }
         }
     }
@@ -241,42 +251,92 @@ struct ContentView: View {
 
     private var environmentSection: some View {
         SectionCard(title: "环境检查", systemImage: "checkmark.shield") {
-            if model.environmentChecks.isEmpty {
-                ProgressView("正在检查…")
+            if model.hasBlockingEnvironmentFailure {
+                Label(
+                    "还有 \(model.environmentChecks.filter(\.blocksProcessing).count) 项运行环境问题需要处理",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .foregroundStyle(.red)
+            } else if model.isEnvironmentChecking {
+                Label("正在检查运行环境…", systemImage: "hourglass")
+                    .foregroundStyle(.secondary)
             } else {
-                ForEach(model.environmentChecks) { check in
-                    HStack(spacing: 10) {
-                        Image(systemName: check.isOK ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(check.isOK ? .green : .red)
-                        Text(check.name)
-                            .frame(width: 150, alignment: .leading)
-                        Text(check.detail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                }
+                Label("环境已就绪，可以处理动态壁纸", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
             }
 
-            if let warning = model.oldAgentWarning {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("发现旧的自动修复脚本")
-                            .fontWeight(.semibold)
-                        Text(warning + "。它可能导致锁屏/解锁后的壁纸异常。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Button("停用旧脚本") { model.disableOldAgent() }
-                            .buttonStyle(.link)
-                    }
-                    Spacer()
-                }
-                .padding(10)
-                .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            ForEach(model.environmentChecks.filter { $0.requirement == .required }) { check in
+                environmentCheckRow(check)
             }
+
+            if let oldAgent = model.environmentChecks.first(where: { $0.id == "oldLaunchAgent" }) {
+                environmentCheckRow(oldAgent)
+            }
+
+            DisclosureGroup("开发工具（仅源码构建 / 高级恢复需要）") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("普通运行不需要 Git、Python 3、Swift 或 Command Line Tools。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(model.environmentChecks.filter { $0.requirement == .optional && $0.id != "oldLaunchAgent" }) { check in
+                        environmentCheckRow(check)
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func environmentCheckRow(_ check: EnvironmentCheck) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: environmentStatusIcon(check.status))
+                .foregroundStyle(environmentStatusColor(check.status))
+            Text(check.name)
+                .frame(width: 150, alignment: .leading)
+            Text(check.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            if let title = environmentActionTitle(check.action) {
+                Button(title) {
+                    model.performEnvironmentAction(check.action)
+                }
+                .buttonStyle(.link)
+            }
+        }
+    }
+
+    private func environmentStatusIcon(_ status: EnvironmentStatus) -> String {
+        switch status {
+        case .checking: return "hourglass"
+        case .ok: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .error: return "xmark.circle.fill"
+        }
+    }
+
+    private func environmentStatusColor(_ status: EnvironmentStatus) -> Color {
+        switch status {
+        case .checking: return .secondary
+        case .ok: return .green
+        case .warning: return .orange
+        case .error: return .red
+        }
+    }
+
+    private func environmentActionTitle(_ action: EnvironmentAction) -> String? {
+        switch action {
+        case .none: return nil
+        case .refresh: return "重新检测"
+        case .openSoftwareUpdate: return "打开软件更新"
+        case .installCommandLineTools: return "安装开发工具"
+        case .openWallpaperSettings: return "打开系统设置→壁纸"
+        case .openStorageSettings: return "打开存储设置"
+        case .disableOldLaunchAgent: return "停用旧脚本"
+        case .reinstallApplication: return "重新下载应用"
+        case .showHelp: return "查看解决方法"
         }
     }
 
@@ -359,6 +419,11 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .disabled(!model.canStart)
+            if !model.isProcessing, let reason = model.environmentBlockReason {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
     }
 
@@ -389,7 +454,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("WallpaperConverter · v0.7.0")
+            Text("WallpaperConverter · v\(appVersion)")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()
@@ -397,6 +462,12 @@ struct ContentView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
+    }
+
+    private var appVersion: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? "开发版"
     }
 }
 

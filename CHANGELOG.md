@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.8.0 — 2026-09-10
+
+- 将 temporal encoder 改为发行构建阶段编译并内置 arm64 可执行文件，随 App 提供第三方许可证、可选源码和带架构/SHA-256 的 manifest；运行时校验资源完整性，不再依赖 Git 或 swiftc。
+- 将 temporal sample group 验证移植为原生 Swift，支持 32 位、64 位扩展和 size==0 的 BMFF box；普通运行不再调用 Python 3，并在验证失败时阻止安装。
+- 重做运行环境检查，区分 required/optional、状态、稳定 ID、阻塞逻辑和快速修复操作；增加 macOS、Apple Silicon、内置 encoder、已下载动态壁纸、磁盘空间和旧 LaunchAgent 检查。
+- 新增 Debug 环境缺失模拟、内置 encoder 完整性测试、temporal validator 测试和发行打包脚本；版本号与 Bundle Identifier 更新为 0.8.0 / build 8 和 `io.github.efjuemie.WallpaperConverter`。
+- 补充普通用户 Releases 安装、环境修复、开发者构建、数据位置、安全和常见问题说明；当前 GitHub Releases 尚无已发布附件。
+
 ## 0.7.0 — 2026-09-10
 
 - 修复解锁后桌面静态层延迟重载时横向拉伸：将每个 UUID 的系统原生画布原子保存到 `native-canvases.json`。明确的清单尺寸会写入记录；完全没有任何类型历史的首次使用可记录几何合法的已下载目标；旧版本升级仅在最早原壁纸归档与最早备份画布一致时恢复记录，否则失败关闭。“已编码”历史只用于阻止误判为首次使用，绝不参与原生画布取证。

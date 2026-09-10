@@ -310,11 +310,317 @@ enum WallpaperGeometry {
     }
 }
 
-struct EnvironmentCheck: Identifiable, Sendable {
-    let id = UUID()
+enum EnvironmentStatus: Equatable, Sendable {
+    case checking
+    case ok
+    case warning
+    case error
+}
+
+enum EnvironmentRequirement: Equatable, Sendable {
+    case required
+    case optional
+}
+
+enum EnvironmentAction: Equatable, Sendable {
+    case none
+    case refresh
+    case openSoftwareUpdate
+    case installCommandLineTools
+    case openWallpaperSettings
+    case openStorageSettings
+    case disableOldLaunchAgent
+    case reinstallApplication
+    case showHelp(String)
+
+    var requiresConfirmation: Bool {
+        switch self {
+        case .installCommandLineTools, .disableOldLaunchAgent:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+struct EnvironmentCheck: Identifiable, Equatable, Sendable {
+    let id: String
     let name: String
-    let isOK: Bool
+    let status: EnvironmentStatus
+    let requirement: EnvironmentRequirement
     let detail: String
+    let action: EnvironmentAction
+
+    var isOK: Bool { status == .ok }
+
+    var blocksProcessing: Bool {
+        requirement == .required && status == .error
+    }
+}
+
+struct EnvironmentProbe: Sendable {
+    var macOSSupported: Bool
+    var macOSDetail: String
+    var architecture: String
+    var encoderDetail: String?
+    var aerialCount: Int
+    var freeBytes: Int64
+    var oldLaunchAgentRunning: Bool
+    var oldLaunchAgentDetail: String
+    var commandLineToolsDetail: String?
+    var swiftDetail: String?
+    var gitDetail: String?
+    var pythonDetail: String?
+
+    static var allAvailable: EnvironmentProbe {
+        EnvironmentProbe(
+            macOSSupported: true,
+            macOSDetail: "macOS 13 或更高版本",
+            architecture: "arm64",
+            encoderDetail: "已准备内置 VideoToolbox 编码器",
+            aerialCount: 1,
+            freeBytes: 100_000_000_000,
+            oldLaunchAgentRunning: false,
+            oldLaunchAgentDetail: "未发现旧自动修复脚本",
+            commandLineToolsDetail: "已安装",
+            swiftDetail: "Swift 已安装",
+            gitDetail: "Git 已安装",
+            pythonDetail: "Python 3 已安装"
+        )
+    }
+}
+
+enum EnvironmentSimulation {
+    static func missing(from value: String?) -> Set<String> {
+        #if DEBUG
+        guard let value else { return [] }
+        return Set(value.split { $0 == "," || $0 == ";" || $0 == " " || $0 == "\n" }
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty })
+        #else
+        return []
+        #endif
+    }
+
+    static func applying(_ missing: Set<String>, to probe: EnvironmentProbe) -> EnvironmentProbe {
+        var result = probe
+        if missing.contains("macos") {
+            result.macOSSupported = false
+            result.macOSDetail = "当前 macOS 版本低于 13"
+        }
+        if missing.contains("architecture") {
+            result.architecture = "x86_64"
+        }
+        if missing.contains("encoder") {
+            result.encoderDetail = nil
+        }
+        if missing.contains("aerial") {
+            result.aerialCount = 0
+        }
+        if missing.contains("diskspace") || missing.contains("disk") {
+            result.freeBytes = 0
+        }
+        if missing.contains("clt") || missing.contains("commandlinetools") {
+            result.commandLineToolsDetail = nil
+        }
+        if missing.contains("swiftc") || missing.contains("swift") {
+            result.swiftDetail = nil
+        }
+        if missing.contains("git") {
+            result.gitDetail = nil
+        }
+        if missing.contains("python3") || missing.contains("python") {
+            result.pythonDetail = nil
+        }
+        return result
+    }
+}
+
+enum EnvironmentCheckBuilder {
+    static let minimumFreeBytes: Int64 = 1_500_000_000
+
+    static func checking() -> [EnvironmentCheck] {
+        [
+            check(id: "macos", name: "macOS", status: .checking, requirement: .required, detail: "正在检查…", action: .none),
+            check(id: "architecture", name: "处理器架构", status: .checking, requirement: .required, detail: "正在检查…", action: .none),
+            check(id: "encoder", name: "内置编码器", status: .checking, requirement: .required, detail: "正在验证…", action: .none),
+            check(id: "aerial", name: "Apple 动态壁纸", status: .checking, requirement: .required, detail: "正在检查已下载的动态壁纸…", action: .none),
+            check(id: "diskSpace", name: "磁盘空间", status: .checking, requirement: .required, detail: "正在检查…", action: .none),
+            check(id: "oldLaunchAgent", name: "旧自动脚本", status: .checking, requirement: .optional, detail: "正在检查…", action: .none),
+            check(id: "commandLineTools", name: "Command Line Tools", status: .checking, requirement: .optional, detail: "正在检查…", action: .none),
+            check(id: "swift", name: "Swift / swiftc", status: .checking, requirement: .optional, detail: "正在检查…", action: .none),
+            check(id: "git", name: "Git", status: .checking, requirement: .optional, detail: "正在检查…", action: .none),
+            check(id: "python", name: "Python 3", status: .checking, requirement: .optional, detail: "正在检查…", action: .none)
+        ]
+    }
+
+    static func build(_ probe: EnvironmentProbe) -> [EnvironmentCheck] {
+        let oldStatus: EnvironmentStatus = probe.oldLaunchAgentRunning ? .warning : .ok
+        let commandLineAction: EnvironmentAction = probe.commandLineToolsDetail == nil
+            ? .installCommandLineTools
+            : .none
+        let swiftAction: EnvironmentAction
+        if probe.swiftDetail != nil {
+            swiftAction = .none
+        } else if probe.commandLineToolsDetail == nil {
+            swiftAction = .installCommandLineTools
+        } else {
+            swiftAction = .showHelp("Command Line Tools 已存在但未找到 swiftc，请重新安装或检查 Xcode 工具链。")
+        }
+
+        let diskDetail = probe.freeBytes >= minimumFreeBytes
+            ? "可用 " + ByteCountFormatter.string(fromByteCount: probe.freeBytes, countStyle: .file)
+            : "可用空间少于 1.5 GB"
+
+        return [
+            check(
+                id: "macos",
+                name: "macOS",
+                status: probe.macOSSupported ? .ok : .error,
+                requirement: .required,
+                detail: probe.macOSDetail,
+                action: probe.macOSSupported ? .none : .openSoftwareUpdate
+            ),
+            check(
+                id: "architecture",
+                name: "处理器架构",
+                status: probe.architecture == "arm64" ? .ok : .error,
+                requirement: .required,
+                detail: probe.architecture == "arm64"
+                    ? "Apple Silicon (arm64)"
+                    : "当前为 \(probe.architecture)，发行版仅支持 Apple Silicon",
+                action: probe.architecture == "arm64"
+                    ? .none
+                    : .showHelp("请使用 Apple Silicon Mac；当前发行版不支持 Intel。")
+            ),
+            check(
+                id: "encoder",
+                name: "内置编码器",
+                status: probe.encoderDetail == nil ? .error : .ok,
+                requirement: .required,
+                detail: probe.encoderDetail ?? "内置编码器缺失或损坏，请重新下载应用。",
+                action: probe.encoderDetail == nil ? .reinstallApplication : .none
+            ),
+            check(
+                id: "aerial",
+                name: "Apple 动态壁纸",
+                status: probe.aerialCount > 0 ? .ok : .error,
+                requirement: .required,
+                detail: probe.aerialCount > 0
+                    ? "已找到 \(probe.aerialCount) 个已下载的动态壁纸"
+                    : "尚未下载动态壁纸",
+                action: probe.aerialCount > 0 ? .none : .openWallpaperSettings
+            ),
+            check(
+                id: "diskSpace",
+                name: "磁盘空间",
+                status: probe.freeBytes >= minimumFreeBytes ? .ok : .error,
+                requirement: .required,
+                detail: diskDetail,
+                action: probe.freeBytes >= minimumFreeBytes ? .none : .openStorageSettings
+            ),
+            check(
+                id: "oldLaunchAgent",
+                name: "旧自动脚本",
+                status: oldStatus,
+                requirement: .optional,
+                detail: probe.oldLaunchAgentRunning
+                    ? probe.oldLaunchAgentDetail
+                    : "未发现旧自动修复脚本",
+                action: probe.oldLaunchAgentRunning ? .disableOldLaunchAgent : .none
+            ),
+            check(
+                id: "commandLineTools",
+                name: "Command Line Tools",
+                status: probe.commandLineToolsDetail == nil ? .warning : .ok,
+                requirement: .optional,
+                detail: probe.commandLineToolsDetail ?? "未安装（仅源码构建或高级恢复需要）",
+                action: commandLineAction
+            ),
+            check(
+                id: "swift",
+                name: "Swift / swiftc",
+                status: probe.swiftDetail == nil ? .warning : .ok,
+                requirement: .optional,
+                detail: probe.swiftDetail ?? "未找到（普通运行不需要）",
+                action: swiftAction
+            ),
+            check(
+                id: "git",
+                name: "Git",
+                status: probe.gitDetail == nil ? .warning : .ok,
+                requirement: .optional,
+                detail: probe.gitDetail ?? "未安装（普通运行不需要）",
+                action: probe.gitDetail == nil
+                    ? .showHelp("Git 仅用于开发者从源码构建；普通运行不需要。")
+                    : .none
+            ),
+            check(
+                id: "python",
+                name: "Python 3",
+                status: probe.pythonDetail == nil ? .warning : .ok,
+                requirement: .optional,
+                detail: probe.pythonDetail ?? "未安装（应用已使用原生 Swift 验证器）",
+                action: probe.pythonDetail == nil
+                    ? .showHelp("Python 3 仅保留给上游源码调试；普通运行不需要。")
+                    : .none
+            )
+        ]
+    }
+
+    static func canProcess(_ checks: [EnvironmentCheck]) -> Bool {
+        !checks.contains(where: \.blocksProcessing)
+    }
+
+    private static func check(
+        id: String,
+        name: String,
+        status: EnvironmentStatus,
+        requirement: EnvironmentRequirement,
+        detail: String,
+        action: EnvironmentAction
+    ) -> EnvironmentCheck {
+        EnvironmentCheck(
+            id: id,
+            name: name,
+            status: status,
+            requirement: requirement,
+            detail: detail,
+            action: action
+        )
+    }
+}
+
+enum ArchiveRefreshPolicy {
+    static func shouldRefreshArchives(isProcessing: Bool) -> Bool {
+        !isProcessing
+    }
+}
+
+enum LaunchAgentPathPolicy {
+    static func nextAvailableDestination(
+        preferred: URL,
+        fileManager: FileManager = .default
+    ) -> URL {
+        guard fileManager.fileExists(atPath: preferred.path) else {
+            return preferred
+        }
+
+        let directory = preferred.deletingLastPathComponent()
+        let stem = preferred.deletingPathExtension().lastPathComponent
+        let pathExtension = preferred.pathExtension
+        var index = 2
+        while true {
+            let filename = pathExtension.isEmpty
+                ? stem + "-" + String(index)
+                : stem + "-" + String(index) + "." + pathExtension
+            let candidate = directory.appendingPathComponent(filename)
+            if !fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+            index += 1
+        }
+    }
 }
 
 enum ProcessingPhase: Equatable {

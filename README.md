@@ -1,135 +1,154 @@
 # Aerial Wallpaper Converter
 
-一个原生 SwiftUI macOS 应用，将短视频转换成带有 HEVC temporal sample groups 的 Aerial 兼容视频，并安全替换当前用户的 macOS 动态壁纸文件。
+一个原生 SwiftUI macOS 应用：将短视频转换为带有 HEVC temporal sample groups 的 Aerial 兼容视频，并安全替换当前用户的 Apple 动态壁纸文件。
 
-当前版本：**0.7.0**
+## 下载与安装
 
-## 功能
+### 普通用户（推荐）
 
-- 拖拽视频、文件选择器或路径输入；支持 `.mov`、`.mp4`、`.m4v`。
-- 默认目标 UUID：`00BA71CD-2C54-415A-A68A-8358E677D750`，也可选择已安装 Aerial 或手动输入 UUID。
-- 自动读取时长并计算循环次数，默认生成约 300 秒的视频。
-- 默认 12 Mbps、HEVC Main 10 编码。
-- 强制验证 `sgpd 'tscl'`、`sgpd 'tsas'`、`csgm 'tscl'`、`csgm 'tsas'` 四项标记。
-- 替换前同时保存应用备份和应用文件夹中 `壁纸` 目录的连续编号归档。
-- 如果输入视频比例与主显示器不同，会先显示首帧预览和固定屏幕比例的可拖动裁剪框；默认使用居中裁剪，可拖动范围会限制在系统居中裁切后仍能精确还原预览框的区域，原画面不拉伸且不补黑边。最终视频使用系统目标 Aerial 的原生编码画布，而不是屏幕物理像素尺寸，以兼容动态视频转桌面静态画面的系统流程。
-- 使用 SHA-256 校验和临时文件原子替换，失败时不安装；安装失败会尝试恢复备份。
-- 支持恢复历史备份、打开日志、检查旧的自动 LaunchAgent。
-- 支持快速打开系统动态壁纸文件夹，并可为应用归档填写自定义名称。
-- 第二个“历史壁纸”选项卡提供首帧缩略图、放大预览、重命名、删除和快速替换。
-- 历史列表同时保留替换前原动态壁纸和成功安装过的新编码壁纸；回退原壁纸后仍可再次选择新编码版本。
-- 不常驻后台，不使用 `killall WallpaperAerialsExtension`，不需要 root 或关闭 SIP。
-- 编码器源文件随应用打包，正常使用无需连接 GitHub；应用内置简约 Logo 和 macOS AppIcon。
+普通用户无需 clone 源码。当前仓库正在准备首个 `0.8.0` 发行包，GitHub Releases 暂无可下载附件；发行包完成并发布后，请从本仓库的 [Releases](https://github.com/efjuemie/macos-aerial-wallpaper-converter/releases) 页面下载与设备匹配的 Apple Silicon DMG 或 ZIP。
 
-## 系统要求
+安装步骤：
 
-- macOS 13 或更高版本；编码器使用 Apple VideoToolbox，推荐 Apple Silicon。
-- Xcode Command Line Tools（提供 `swiftc`）。
-- Git 和 Python 3（Python 3 仅用于 `groups.py` 验证）。
-- 必须先在“系统设置 → 壁纸”中下载至少一个动态壁纸，目标 `.mov` 才会存在；没有已下载文件时，应用不能执行替换。
+1. 打开 `Aerial-Wallpaper-Converter-vX.Y.Z-Apple-Silicon.dmg`。
+2. 将 `WallpaperConverter.app` 拖到“应用程序”。
+3. 打开应用并查看“环境检查”。
+4. 如果 macOS 首次拦截应用，打开“系统设置 → 隐私与安全性”，找到本应用提示并选择“仍要打开”。当前构建为 ad-hoc 签名，不声称 Developer ID 签名或 Apple 公证。
 
-## 使用前必须下载系统动态壁纸
+`git clone` 得到的是项目源码，不是已经安装好的 macOS App。只有开发或调试本项目时才需要从源码构建。
 
-本应用不会在系统设置中创建新的动态壁纸条目。请先打开“系统设置 → 壁纸”，选择并下载一个 Apple 动态壁纸，等待下载完成。应用的实际工作方式，是找到该系统壁纸已经下载到本机的 `.mov` 文件，先备份原文件，再用用户处理后的视频替换它。因此，未下载系统动态壁纸时，“已安装的动态壁纸”列表不可用。
+### 系统要求
 
-首次点击“处理并替换”时，应用会优先使用随应用打包的编码器源文件，并缓存编译结果到：
+普通运行需要：
 
-```text
-~/Library/Application Support/WallpaperConverter/Encoder/macos-custom-video-wallpaper-fix-bundled-v4
-```
+- macOS 13 或更高版本；
+- Apple Silicon（arm64）；
+- 至少一个已从“系统设置 → 壁纸”下载的 Apple 动态壁纸；
+- 至少 1.5 GB 可用磁盘空间。
 
-因此，即使 GitHub 无法连接，已打包的应用仍可准备并编译编码器。只有在应用资源缺失时，才会使用网络下载作为后备路径。应用不会删除已有的旧编码器目录，也不会自动执行 `git pull`。上游项目接口和原理见 [macos-custom-video-wallpaper-fix](https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix)，对应源文件和 MIT License 位于本仓库的 `ThirdParty/` 目录。
+普通用户不需要 Git、Python 3、Xcode、Xcode Command Line Tools 或手动安装 Swift。
 
-## 从 Wallpaper Engine 获取并准备壁纸
+## 使用前必须下载 Apple 动态壁纸
 
-macOS 版 Wallpaper Engine 目前不能直接运行，因此通常需要在 Windows 环境中导出视频；也可以使用其他支持导出视频的壁纸网站或应用。
+本应用不会在系统设置中创建新的动态壁纸条目。请先打开“系统设置 → 壁纸”，选择并下载一个 Apple 动态壁纸，等待下载完成。应用只替换已经下载到本机的系统 `.mov` 文件；没有可用目标时，环境检查会提供“打开系统设置→壁纸”按钮。
 
-以 Steam 版 Wallpaper Engine 为例：
+## 快速开始
 
-1. 订阅一个壁纸。
-2. 右键壁纸，选择“发送至移动设备”。
-3. 在移动设备页面点击“导出 `.mpkg` 文件”。
-4. 在弹窗中选择“预渲染：高性能”。
-5. 视频裁剪选择“保持原始宽高比”。
-6. 帧率选择 `60`，然后导出。
+1. 打开应用，等待“环境检查”完成；按提示修复红色的运行环境项目。
+2. 将 `.mov`、`.mp4` 或 `.m4v` 视频拖入窗口，或点击“选择文件”。
+3. 选择已下载的目标动态壁纸，确认 UUID、目标时长和码率。
+4. 如视频比例不同，拖动裁剪框；不调整则使用居中裁剪。
+5. 点击“处理并替换”并确认。应用会使用内置 arm64 VideoToolbox 编码器，验证画布元数据和四项 temporal sample groups 后才会安装。
+6. 完成后在系统设置中重新点击对应动态壁纸，并连续测试 5 次“锁屏 → 解锁”。
 
-如果导出的壁纸包含场景或是 `.pkg` / `.mpkg` 格式，可以使用 Windows 版 `RePKG-GUI_v1.0.1` 将其提取为 `.mp4`。该工具疑似不支持 macOS，请在 Windows 电脑或 Windows 虚拟机中完成这一步；不要在 macOS 上直接运行 ZIP 中的 `.exe` 文件。操作参考：[1分钟教会你提取 Wallpaper Engine 动态壁纸 pkg 格式 RePKG-GUI 软件使用教程](https://www.bilibili.com/video/BV1fKkuBtEtQ/?share_source=copy_web&vd_source=bd22f6255144a26beb7e590998543f34)。
+桌面保持静态是 macOS 的正常现象；若出现黑屏、冻结或第二次不播放，请在应用中恢复备份。
 
-得到 `.mp4` 后，可以使用其他视频工具转换为 `.mov`。一个在线参考工具是 [SubHero 视频转换器](https://subhero.io/zh-Hans/tools/video-converter)。上传私人或敏感视频到第三方网站前，请先确认其隐私政策；也可以使用本地视频转换工具。
+## 环境检查与修复
 
-## 壁纸处理全流程
+应用启动和从后台回到 active 时会自动检查：macOS 版本、Apple Silicon 架构、应用内置编码器、已下载动态壁纸和 1.5 GB 磁盘空间。只有这些 required 项目失败才会阻止处理。
 
-1. 先在“系统设置 → 壁纸”中下载至少一个动态壁纸。应用只能替换已经下载到本机的系统 `.mov` 文件。
-2. 准备一个 `.mov` 文件。应用也接受 `.mp4` 和 `.m4v`，会统一交给内置编码器处理。
-3. 打开应用，将视频拖入窗口，或点击“选择文件”，也可以在路径输入框中粘贴完整路径。
-4. 确认目标动态壁纸 UUID。默认目标为 `00BA71CD-2C54-415A-A68A-8358E677D750`；也可以从当前动态壁纸目录选择其他已安装壁纸或手动输入 UUID。需要定位目录时，可点击应用中的“打开动态壁纸文件夹”。
-5. 确认目标时长和码率。默认目标时长为 300 秒，码率为 12 Mbps，应用会根据原视频时长自动计算循环次数。“归档名称（可选）”命名的是本次替换前保存的系统原壁纸，不会重命名拖入的新视频。
-6. 点击“处理并替换”。如果视频比例与主显示器不同，应用会先打开裁剪窗口；拖动白色裁剪框选择画面，直接点击“下一步”则使用默认的居中裁剪。随后确认处理。应用会检查开发环境和磁盘空间，使用 HEVC Main 10 编码，然后验证 `sgpd/csgm` 中的 `tscl` 与 `tsas` 四项标记。
-7. 验证通过后，应用确认目标文件存在，备份原动态壁纸，并将原文件复制到应用文件夹的 `壁纸` 目录，按 `1-UUID.mov`、`2-UUID.mov` 的顺序编号；也可以填写自定义归档名称，例如 `1-我的夜景.mov`。成功安装的新编码视频也会保存到 `壁纸/已编码`，供“历史壁纸”再次使用。
-8. 应用会把屏幕比例裁剪选择映射到系统目标 Aerial 的原生编码画布，完整填充画布且不做非等比缩放。每个 UUID 的可信原生画布会原子记录在 `~/Library/Application Support/WallpaperConverter/native-canvases.json`：清单明确给出像素尺寸时记录清单；没有任何原壁纸、已编码壁纸或备份历史的首次使用记录当前已下载目标；旧版本升级没有记录时，仅接受同 UUID 最早原壁纸归档与最早备份的相同画布。证据缺失或冲突会停止处理，不按数量或面积猜测，也不会把已编码视频作为原生画布证据。安装前会验证 encoded、natural、clean aperture 与 presentation 尺寸完全一致，同时要求 1:1 方形像素和恒等显示变换。
-9. 新视频会先复制到目标目录中的临时文件，完成 SHA-256 校验后再原子替换目标文件。应用只重载一次 `WallpaperAgent`；完成后打开“系统设置 → 壁纸”，重新点击对应动态壁纸。
-10. 使用 `Control + Command + Q` 锁屏，连续测试至少 5 次“锁屏 → 解锁”。桌面保持静态是正常的；黑屏、冻结或第二次不播放时，请在应用中恢复备份。
+检查面板中的操作包括：
 
-应用不会通过常驻脚本在每次解锁后杀掉壁纸进程，也不会修改系统保护目录。
+- “打开软件更新”：打开 macOS 官方软件更新设置；
+- “打开系统设置→壁纸”：下载 Apple 动态壁纸；
+- “打开存储设置”：清理空间后重新检测；
+- “重新下载应用”：打开本项目 Releases 页面，适用于内置编码器资源缺失或损坏；
+- “停用旧脚本”：卸载精确的旧 LaunchAgent 服务，安全保留配置并重新检测；
+- “安装开发工具”：仅为源码构建或高级恢复唤起 macOS 官方 Command Line Tools 安装器，不使用 sudo、不自动安装 Homebrew。
 
-## 构建
+Git、Python 3、Swift 和 Command Line Tools 位于折叠的“开发工具”区域，不是普通运行依赖。应用运行时使用原生 Swift temporal sample group validator，不调用 Python、Git 或 swiftc。
 
-```bash
-./build_app.sh
-open dist/WallpaperConverter.app
-```
+## 功能与安全流程
 
-如需检查某个处理结果的画布元数据，可执行：
+- 支持拖拽、文件选择器和路径输入；自动读取时长、分辨率并计算循环次数。
+- 默认使用 HEVC Main 10、12 Mbps，并保留 `sgpd 'tscl'`、`sgpd 'tsas'`、`csgm 'tscl'`、`csgm 'tsas'` 四项验证。
+- 使用目标 Aerial 的可信原生画布，保留 crop 映射、fixed canvas、显式 clean aperture、1:1 像素宽高比和恒等 transform 校验。
+- 安装前保存应用备份和“壁纸”目录中的连续编号原壁纸归档；成功安装的新编码视频也保存到“已编码”历史。
+- 输出先写临时文件，完成 SHA-256 校验后原子替换；安装失败会尝试回滚到备份。
+- WallpaperAgent 最多只重载一次；应用不常驻后台，不使用 `killall WallpaperAerialsExtension`，不要求 root，不修改 SIP 或系统保护目录。
 
-```bash
-swift Scripts/verify_video_geometry.swift /path/to/output.mov <目标画布宽度> <目标画布高度>
-```
+## 完整处理流程
 
-目标宽高请使用应用日志中 `Prepared canvas ... output=WIDTHxHEIGHT` 报告的值，而不是固定填写某个 4K 尺寸。验证器会检查 natural、encoded、clean aperture、presentation、显式 1:1 像素宽高比和 `preferredTransform`；任一项不符合预期都会以非零状态退出。
+应用先准备裁剪布局和目标原生画布，然后验证内置 `Encoder/bin/encode_temporal` 的存在、可执行权限、arm64 架构和 manifest 中的 SHA-256。接着执行 HEVC temporal 编码，检查输出几何（encoded、natural、clean aperture、presentation）、显式元数据和四项 sample group。所有检查通过后才确认目标文件、创建备份与归档，再执行 SHA-256 校验和临时文件原子替换。
 
-这是一个本地未签名应用。首次运行时 macOS 可能需要在“系统设置 → 隐私与安全性”中允许打开。
+任一关键检查失败都会停止安装，原始目标文件保持不变。上游 `groups.py` 仍随源码保留作参考和许可证合规用途，但普通运行不调用它。
 
-应用没有启用 App Sandbox，因为它需要访问当前用户的：
+## 历史壁纸、备份与数据位置
+
+应用支持“历史壁纸”选项卡，可生成首帧预览、放大查看、重命名、删除和快速替换；原壁纸与成功安装过的新编码壁纸分别标记。历史预览损坏时会在刷新时重新生成，单个项目失败不会阻塞其他项目。
+
+数据保存在当前用户目录，不会迁移或删除旧数据：
+
+- 编码临时输出：`~/Library/Application Support/WallpaperConverter/Processed/`；
+- 应用备份：`~/Library/Application Support/WallpaperConverter/Backups/`；
+- 原壁纸归档：`~/Library/Application Support/WallpaperConverter/壁纸/`；
+- 已编码历史：`~/Library/Application Support/WallpaperConverter/壁纸/已编码/`；
+- 原生画布记录：`~/Library/Application Support/WallpaperConverter/native-canvases.json`；
+- 日志：`~/Library/Logs/WallpaperConverter.log`。
+
+目标 Apple 动态壁纸位于：
 
 ```text
 ~/Library/Application Support/com.apple.wallpaper/aerials/videos/
 ```
 
-应用只操作用户目录，不修改 `/System`、`/System/Library`，也不要求 sudo。
+## 常见问题
 
-## 历史壁纸
+### 为什么没有动态壁纸可选？
 
-第二个“历史壁纸”选项卡读取应用归档目录中的原动态壁纸和 `已编码` 子目录中的成功编码壁纸，并为每个视频生成 JPEG 预览（最大尺寸为 1920×1080，并按原比例缩放）。生成器会依次尝试多个安全取帧时刻；缺失或损坏的 JPEG 会在刷新时重新生成，单个视频失败不会阻塞其他项目，并会把具体错误写入日志。点击缩略图后，可以在下方查看放大预览、编辑名称、快速替换当前目标、打开视频或显示所在文件夹。删除操作会同时删除归档视频和对应预览。选择“原壁纸”可回退到替换前版本；选择“已编码”可在回退后重新安装之前成功使用过的新版本。
+先在“系统设置 → 壁纸”下载并应用至少一个 Apple 动态壁纸，再点击“重新检测”。
 
-归档名称默认是 `编号-UUID`，如果之前填写了自定义归档名则显示自定义文件名；重命名会同步更新视频文件名和预览文件名，并保留原编号及目标 UUID 元数据。
+### 为什么提示内置编码器损坏？
 
-## 处理结果位置
+发行包中的 encoder、架构或 SHA-256 manifest 校验失败。重新从 Releases 下载与设备匹配的 Apple Silicon 包；不要为普通使用安装 Xcode、Git 或 Python。
 
-- 编码临时输出：`~/Library/Application Support/WallpaperConverter/Processed/`（成功安装后会移动到下方的 `已编码` 目录）
-- 应用备份：`~/Library/Application Support/WallpaperConverter/Backups/`
-- 被替换的原文件：`~/Library/Application Support/WallpaperConverter/壁纸/数字-UUID.mov`
-- 已成功安装的新编码壁纸：`~/Library/Application Support/WallpaperConverter/壁纸/已编码/UUID-fixed-时间.mov`
-- 首帧预览：`~/Library/Application Support/WallpaperConverter/壁纸/预览/数字-UUID.jpg`
-- 历史壁纸名称与目标 UUID：`~/Library/Application Support/WallpaperConverter/壁纸/metadata.json`
-- 日志：`~/Library/Logs/WallpaperConverter.log`
+### 为什么环境检查显示 Git、Python 或 Swift 警告？
 
-首次使用或点击“打开归档文件夹”时，如果 `壁纸` 目录不存在，应用会自动创建应用支持目录、预览目录及 `已编码` 子目录。旧版本桌面 `~/Desktop/壁纸` 中的 `.mov` 归档会在读取历史壁纸时安全迁移到新目录；旧版本 `Processed` 中的编码输出也会自动迁移到 `壁纸/已编码`，因此历史壁纸中仍可重新使用过去成功生成的版本。
+这些是开发工具提示，不会阻止普通运行。只有从源码构建或进行上游高级恢复时才需要它们。
 
-完成后请在系统设置中重新点击对应动态壁纸，并连续测试 5 次“锁屏 → 解锁”。桌面保持静态是正常现象；如果出现黑屏、冻结或第二次不播放，可在应用中恢复备份。
+### 为什么桌面不动或锁屏黑屏？
 
-## 安全流程
+请在系统设置中重新点击对应动态壁纸并连续测试 5 次锁屏→解锁。若仍异常，先在应用中恢复备份；不要运行常驻杀进程脚本。
 
-1. 检查 Command Line Tools、Swift、Git、Python 3 和 Aerial 目录。
-2. 检查至少 1.5 GB 可用磁盘空间。
-3. 准备或编译上游 temporal encoder。
-4. 按系统目标 Aerial 原生画布编码，并验证固定尺寸、方形像素、恒等显示变换及四项 temporal sample groups。
-5. 确认目标 UUID 文件存在。
-6. 备份原文件并保存应用目录中的编号归档及首帧预览。
-7. 复制到目标目录中的临时文件，校验后原子替换。
-8. 校验目标 SHA-256，并只重载一次 `WallpaperAgent`。
+### 为什么首次打开被 macOS 拦截？
 
-任一关键步骤失败都会停止安装，并保留原始目标文件。
+当前本地发行构建使用 ad-hoc 签名，尚未配置 Developer ID 和公证。按系统提示打开“系统设置 → 隐私与安全性 → 仍要打开”。不要把关闭 SIP 或 `xattr -dr com.apple.quarantine` 作为默认步骤。
 
-## 版本更新
+## 从源码构建（仅开发者）
 
-版本历史记录在 [CHANGELOG.md](CHANGELOG.md)。
+源码构建需要 macOS 13+、Apple Silicon、Xcode Command Line Tools 和 Swift。Git 只用于取得源码；Python 3 不参与普通构建或运行。
+
+```bash
+git clone https://github.com/efjuemie/macos-aerial-wallpaper-converter.git
+cd macos-aerial-wallpaper-converter
+./build_app.sh
+open dist/WallpaperConverter.app
+```
+
+`build_app.sh` 会在构建期编译 arm64 temporal encoder、复制第三方许可证和可选源码、生成带版本/架构/SHA-256 的 manifest，并对 App 和内置 encoder 做 ad-hoc 签名与严格验证。发行包使用：
+
+```bash
+Scripts/package_release.sh
+```
+
+输出到 `dist/releases/` 的 ZIP 和 DMG 文件名会从 App 的 `Info.plist` 版本字段生成。DMG 包含 `WallpaperConverter.app` 和指向 `/Applications` 的快捷方式。当前项目没有 Developer ID 证书，因此本地包不公证。
+
+Debug 构建可使用 `WALLPAPER_CONVERTER_FAKE_MISSING=encoder,aerial,diskSpace,git,python3,swiftc,clt,architecture,macos` 模拟缺失环境；Release 构建忽略该变量。
+
+如需检查视频画布元数据，可执行：
+
+```bash
+swift Scripts/verify_video_geometry.swift /path/to/output.mov <宽度> <高度>
+```
+
+## Wallpaper Engine 视频准备
+
+macOS 版 Wallpaper Engine 通常不能直接运行，可在 Windows 或 Windows 虚拟机中导出视频：订阅壁纸 → 发送至移动设备 → 导出 `.mpkg` → 选择“预渲染：高性能”、保持原始宽高比、60 FPS。若得到 `.pkg` / `.mpkg`，可使用 Windows 版 RePKG-GUI 提取 `.mp4`，再用本地视频工具转换为 `.mov`。上传私人视频到在线转换服务前请先确认隐私政策。
+
+## 第三方许可证
+
+内置 temporal encoder 来自 [macos-custom-video-wallpaper-fix](https://github.com/AlexisBCD/macos-custom-video-wallpaper-fix)，其 MIT License 和源码随 App 一起放在 `Contents/Resources/Encoder/` 中；上游 `groups.py` 仅作为参考实现保留。发行包不依赖在线 clone，也不会从未固定的第三方 `main` 分支下载后执行。
+
+## 版本
+
+当前源码版本为 **0.8.0**，完整记录见 [CHANGELOG.md](CHANGELOG.md)。

@@ -11,14 +11,6 @@ enum AppPaths {
         "Library/Application Support/WallpaperConverter",
         isDirectory: true
     )
-    static let encoderRepository = appSupport.appendingPathComponent(
-        "Encoder/macos-custom-video-wallpaper-fix",
-        isDirectory: true
-    )
-    static let bundledEncoderCache = appSupport.appendingPathComponent(
-        "Encoder/macos-custom-video-wallpaper-fix-bundled-v4",
-        isDirectory: true
-    )
     static let processedDirectory = appSupport.appendingPathComponent(
         "Processed",
         isDirectory: true
@@ -58,10 +50,10 @@ enum AppPaths {
         "Library/LaunchAgents/com.local.wallpaper-aerial-fix.plist.disabled"
     )
 
-    static var bundledEncoderRepository: URL? {
+    static var bundledEncoderDirectory: URL? {
         let candidates = [
             Bundle.main.resourceURL?.appendingPathComponent(
-                "Encoder/macos-custom-video-wallpaper-fix",
+                "Encoder",
                 isDirectory: true
             ),
             URL(fileURLWithPath: #filePath)
@@ -75,7 +67,19 @@ enum AppPaths {
         ].compactMap { $0 }
 
         return candidates.first {
-            fileManager.fileExists(atPath: $0.appendingPathComponent("encode_temporal.swift").path)
+            fileManager.fileExists(atPath: $0.path)
+        }
+    }
+
+    static var bundledEncoderBinary: URL? {
+        bundledEncoderDirectory.map {
+            $0.appendingPathComponent(EncoderAssetSelector.binaryRelativePath)
+        }
+    }
+
+    static var bundledEncoderManifest: URL? {
+        bundledEncoderDirectory.map {
+            $0.appendingPathComponent(EncoderAssetSelector.manifestRelativePath)
         }
     }
 
@@ -149,53 +153,83 @@ final class AppLogger {
 
 enum EnvironmentChecker {
     static func check() async -> [EnvironmentCheck] {
-        var checks: [EnvironmentCheck] = []
+        var probe = await liveProbe()
+        #if DEBUG
+        let fakeMissing = EnvironmentSimulation.missing(
+            from: ProcessInfo.processInfo.environment["WALLPAPER_CONVERTER_FAKE_MISSING"]
+        )
+        probe = EnvironmentSimulation.applying(fakeMissing, to: probe)
+        #endif
+        return EnvironmentCheckBuilder.build(probe)
+    }
 
-        let xcodeSelect = CommandRunner.executable(named: "xcode-select")
-        if let xcodeSelect {
-            do {
-                let result = try await CommandRunner.run(xcodeSelect, arguments: ["-p"])
-                let path = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-                checks.append(EnvironmentCheck(
-                    name: "Command Line Tools",
-                    isOK: result.status == 0 && !path.isEmpty,
-                    detail: result.status == 0 && !path.isEmpty ? path : "缺失，请执行 xcode-select --install"
-                ))
-            } catch {
-                checks.append(EnvironmentCheck(name: "Command Line Tools", isOK: false, detail: error.localizedDescription))
-            }
+    private static func liveProbe() async -> EnvironmentProbe {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        let versionDetail = "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+        #if arch(arm64)
+        let architecture = "arm64"
+        #elseif arch(x86_64)
+        let architecture = "x86_64"
+        #else
+        let architecture = "unknown"
+        #endif
+
+        let encoderDetail: String?
+        if let detail = try? await EncoderService.describeBundledEncoder() {
+            encoderDetail = detail
         } else {
-            checks.append(EnvironmentCheck(name: "Command Line Tools", isOK: false, detail: "未找到 xcode-select"))
+            encoderDetail = nil
         }
 
-        for (name, executableName) in [("Swift", "swiftc"), ("Git", "git"), ("Python 3", "python3")] {
-            guard let executable = CommandRunner.executable(named: executableName) else {
-                checks.append(EnvironmentCheck(name: name, isOK: false, detail: "未找到 \(executableName)"))
-                continue
-            }
-            do {
-                let result = try await CommandRunner.run(executable, arguments: ["--version"])
-                let detail = result.output
-                    .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-                    .first
-                    .map(String.init) ?? executable.path
-                checks.append(EnvironmentCheck(name: name, isOK: result.status == 0, detail: detail))
-            } catch {
-                checks.append(EnvironmentCheck(name: name, isOK: false, detail: error.localizedDescription))
-            }
+        let aerialCount = AerialService.targets().count
+        let freeBytes: Int64
+        if let values = try? FileManager.default.attributesOfFileSystem(
+            forPath: AppPaths.appSupport.deletingLastPathComponent().path
+        ) {
+            freeBytes = (values[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
+        } else {
+            freeBytes = 0
         }
 
-        var isDirectory: ObjCBool = false
-        let aerialAccessible = FileManager.default.fileExists(
-            atPath: AppPaths.aerialDirectory.path,
-            isDirectory: &isDirectory
-        ) && isDirectory.boolValue
-        checks.append(EnvironmentCheck(
-            name: "Aerial 目录",
-            isOK: aerialAccessible,
-            detail: aerialAccessible ? AppPaths.aerialDirectory.path : "目录不存在，请先在系统设置中下载并应用动态壁纸"
-        ))
-        return checks
+        let oldAgent = await oldLaunchAgentStatus()
+        let commandLineToolsDetail = await commandDetail(
+            named: "xcode-select",
+            arguments: ["-p"]
+        )
+        let swiftDetail = commandLineToolsDetail == nil
+            ? nil
+            : await commandDetail(named: "swiftc", arguments: ["--version"])
+        let gitDetail = commandLineToolsDetail == nil
+            ? nil
+            : await commandDetail(named: "git", arguments: ["--version"])
+        let pythonDetail = await commandDetail(named: "python3", arguments: ["--version"])
+        return EnvironmentProbe(
+            macOSSupported: version.majorVersion >= 13,
+            macOSDetail: versionDetail,
+            architecture: architecture,
+            encoderDetail: encoderDetail,
+            aerialCount: aerialCount,
+            freeBytes: freeBytes,
+            oldLaunchAgentRunning: oldAgent.isRunning,
+            oldLaunchAgentDetail: oldAgent.detail,
+            commandLineToolsDetail: commandLineToolsDetail,
+            swiftDetail: swiftDetail,
+            gitDetail: gitDetail,
+            pythonDetail: pythonDetail
+        )
+    }
+
+    private static func commandDetail(named name: String, arguments: [String]) async -> String? {
+        guard let executable = CommandRunner.executable(named: name),
+              let result = try? await CommandRunner.run(executable, arguments: arguments),
+              result.status == 0 else {
+            return nil
+        }
+        return result.output
+            .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+            .first
+            .map(String.init)
+            .flatMap { $0.isEmpty ? nil : $0 }
     }
 
     static func oldLaunchAgentStatus() async -> (isRunning: Bool, detail: String) {
@@ -212,11 +246,14 @@ enum EnvironmentChecker {
                 reasons.append("LaunchAgent 已加载")
             }
         }
-        if let pgrep = CommandRunner.executable(named: "pgrep"),
-           let result = try? await CommandRunner.run(pgrep, arguments: ["-fl", "wallpaper-aerial-fix"]),
-           result.status == 0 {
+        if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path) {
+            let wasLoaded = running
             running = true
-            reasons.append("旧修复脚本仍在运行")
+            reasons.append(
+                wasLoaded
+                    ? "发现旧 LaunchAgent 配置"
+                    : "发现旧 LaunchAgent 配置（尚未加载）"
+            )
         }
 
         return (running, reasons.isEmpty ? "未发现旧自动修复脚本" : reasons.joined(separator: "；"))
