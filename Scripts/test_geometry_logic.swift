@@ -14,73 +14,246 @@ enum GeometryLogicSmoke {
         let native = AerialCanvas(width: 3840, height: 2152)
         let custom = AerialCanvas(width: 2940, height: 1912)
         let manifest = AerialCanvas(width: 1920, height: 1080)
+        let nativeProfile = profile(for: native)
+        let customProfile = profile(for: custom)
 
-        require(
-            NativeCanvasResolver.resolve(
-                persistedCanvas: native,
-                manifestCanvas: nil,
-                targetCanvas: custom,
-                hasAnyHistoricalRecords: true,
-                earliestOriginalCanvas: custom,
-                earliestBackupCanvas: custom
-            ) == NativeCanvasResolution(canvas: native, shouldPersist: false),
-            "persisted native canvas must be reused without inspecting new output"
+        let freshConflict = NativeCanvasResolver.resolve(
+            persistedRecord: nil,
+            manifestCanvas: manifest,
+            targetProfile: nativeProfile,
+            hasAnyHistoricalRecords: false,
+            earliestOriginalProfile: nil,
+            earliestBackupProfile: nil
         )
-        require(
-            NativeCanvasResolver.resolve(
-                persistedCanvas: native,
-                manifestCanvas: manifest,
-                targetCanvas: nil,
-                hasAnyHistoricalRecords: true,
-                earliestOriginalCanvas: nil,
-                earliestBackupCanvas: nil
-            ) == NativeCanvasResolution(canvas: manifest, shouldPersist: true),
-            "explicit manifest canvas must be persisted"
+        require(freshConflict?.canvas == native, "fresh target must win over manifest")
+        require(freshConflict?.source == .currentTarget, "fresh target provenance must be recorded")
+        require(freshConflict?.conflicts.isEmpty == false, "manifest mismatch must be visible")
+
+        let persisted = NativeCanvasRecord(
+            canvas: native,
+            source: .currentTarget,
+            originalTargetSHA256: String(repeating: "a", count: 64),
+            capturedAt: Date(timeIntervalSince1970: 1),
+            geometry: nativeProfile
         )
-        require(
-            NativeCanvasResolver.resolve(
-                persistedCanvas: nil,
-                manifestCanvas: nil,
-                targetCanvas: native,
-                hasAnyHistoricalRecords: false,
-                earliestOriginalCanvas: nil,
-                earliestBackupCanvas: nil
-            ) == NativeCanvasResolution(canvas: native, shouldPersist: true),
-            "fresh install may persist a valid downloaded target"
+        let persistedResolution = NativeCanvasResolver.resolve(
+            persistedRecord: persisted,
+            manifestCanvas: manifest,
+            targetProfile: profile(for: custom),
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: nil,
+            earliestBackupProfile: nil
         )
-        require(
-            NativeCanvasResolver.resolve(
-                persistedCanvas: nil,
-                manifestCanvas: nil,
-                targetCanvas: native,
-                hasAnyHistoricalRecords: true,
-                earliestOriginalCanvas: nil,
-                earliestBackupCanvas: nil
-            ) == nil,
-            "encoded or other history must prevent fresh-target trust"
+        require(persistedResolution?.canvas == native, "trusted persisted record must win over current replacement")
+        require(persistedResolution?.source == .persisted, "persisted provenance must be recorded")
+
+        let legacyFresh = NativeCanvasResolver.resolve(
+            persistedRecord: .legacy(canvas: native),
+            manifestCanvas: manifest,
+            targetProfile: nativeProfile,
+            hasAnyHistoricalRecords: false,
+            earliestOriginalProfile: nil,
+            earliestBackupProfile: nil
         )
-        require(
-            NativeCanvasResolver.resolve(
-                persistedCanvas: nil,
-                manifestCanvas: nil,
-                targetCanvas: custom,
-                hasAnyHistoricalRecords: true,
-                earliestOriginalCanvas: native,
-                earliestBackupCanvas: native
-            ) == NativeCanvasResolution(canvas: native, shouldPersist: true),
-            "matching earliest original and backup must recover an upgrade baseline"
+        require(legacyFresh?.source == .manifest, "a v1 record proves prior use and must not relabel the current target as an Apple original")
+
+        let legacyManifestFallback = NativeCanvasResolver.resolve(
+            persistedRecord: .legacy(canvas: native),
+            manifestCanvas: manifest,
+            targetProfile: customProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: nil,
+            earliestBackupProfile: nil
         )
-        require(
-            NativeCanvasResolver.resolve(
-                persistedCanvas: nil,
-                manifestCanvas: nil,
-                targetCanvas: nil,
-                hasAnyHistoricalRecords: true,
-                earliestOriginalCanvas: native,
-                earliestBackupCanvas: custom
-            ) == nil,
-            "conflicting upgrade evidence must fail closed"
+        require(legacyManifestFallback?.source == .manifest, "history without trusted evidence may use a labelled manifest fallback")
+
+        let falseSHA = NativeCanvasResolver.resolve(
+            persistedRecord: persisted,
+            manifestCanvas: manifest,
+            targetProfile: customProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: nativeProfile,
+            earliestBackupProfile: nativeProfile,
+            earliestOriginalSHA256: String(repeating: "b", count: 64)
         )
+        require(falseSHA?.source == .historyConsensus, "a persisted SHA conflicting with the archived original must not win")
+
+        let reidentified = NativeCanvasResolver.resolve(
+            persistedRecord: NativeCanvasRecord(
+                canvas: native,
+                source: .reidentified,
+                originalTargetSHA256: String(repeating: "c", count: 64),
+                capturedAt: Date(timeIntervalSince1970: 3),
+                geometry: nativeProfile
+            ),
+            manifestCanvas: manifest,
+            targetProfile: nativeProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: customProfile,
+            earliestBackupProfile: customProfile,
+            earliestOriginalSHA256: String(repeating: "a", count: 64)
+        )
+        require(reidentified?.source == .persisted, "explicitly re-identified downloaded original must supersede older archived evidence")
+        let reidentifiedRecord = NativeCanvasRecord(
+            canvas: native,
+            source: .reidentified,
+            originalTargetSHA256: String(repeating: "c", count: 64),
+            capturedAt: Date(timeIntervalSince1970: 3),
+            geometry: nativeProfile
+        )
+        let activeOriginal = GeometryDiagnostics.originalReferenceProfile(
+            chosenSource: .persisted,
+            targetHash: String(repeating: "c", count: 64),
+            targetProfile: nativeProfile,
+            persistedRecord: reidentifiedRecord,
+            archiveProfile: customProfile
+        )
+        require(activeOriginal == nativeProfile, "reidentified current target may serve as original only while its SHA still matches")
+        let replacedTarget = GeometryDiagnostics.originalReferenceProfile(
+            chosenSource: .persisted,
+            targetHash: String(repeating: "d", count: 64),
+            targetProfile: customProfile,
+            persistedRecord: reidentifiedRecord,
+            archiveProfile: customProfile
+        )
+        require(replacedTarget == nativeProfile, "after replacement, parity must use saved original geometry rather than custom target")
+
+        let persistedConflict = NativeCanvasResolver.resolve(
+            persistedRecord: persisted,
+            manifestCanvas: manifest,
+            targetProfile: customProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: customProfile,
+            earliestBackupProfile: nativeProfile
+        )
+        require(persistedConflict == nil, "trusted persisted dimensions conflicting with original archive must fail closed")
+
+        let consensus = NativeCanvasResolver.resolve(
+            persistedRecord: nil,
+            manifestCanvas: manifest,
+            targetProfile: customProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: nativeProfile,
+            earliestBackupProfile: nativeProfile
+        )
+        require(consensus?.canvas == native, "matching original and backup must recover baseline")
+        require(consensus?.source == .historyConsensus, "history consensus provenance must be recorded")
+
+        let conflict = NativeCanvasResolver.resolve(
+            persistedRecord: nil,
+            manifestCanvas: manifest,
+            targetProfile: customProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: nativeProfile,
+            earliestBackupProfile: customProfile
+        )
+        require(conflict == nil, "conflicting history evidence must fail closed")
+
+        let historyWithoutEvidence = NativeCanvasResolver.resolve(
+            persistedRecord: nil,
+            manifestCanvas: manifest,
+            targetProfile: customProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: nil,
+            earliestBackupProfile: nil
+        )
+        require(historyWithoutEvidence?.source == .manifest, "historical replacement must not trust current target; manifest is a labelled fallback")
+        let historyWithoutAnyEvidence = NativeCanvasResolver.resolve(
+            persistedRecord: nil,
+            manifestCanvas: nil,
+            targetProfile: customProfile,
+            hasAnyHistoricalRecords: true,
+            earliestOriginalProfile: nil,
+            earliestBackupProfile: nil
+        )
+        require(historyWithoutAnyEvidence == nil, "historical replacement without trusted evidence or manifest must fail closed")
+
+        let manifestFallback = NativeCanvasResolver.resolve(
+            persistedRecord: nil,
+            manifestCanvas: manifest,
+            targetProfile: nil,
+            hasAnyHistoricalRecords: false,
+            earliestOriginalProfile: nil,
+            earliestBackupProfile: nil
+        )
+        require(manifestFallback?.source == .manifest, "manifest should remain an explicit fallback")
+
+        let implicitSquare = AerialGeometryProfile(
+            encodedSize: GeometrySize(width: native.width, height: native.height),
+            naturalSize: GeometrySize(width: native.width, height: native.height),
+            cleanAperture: GeometryRect(x: 0, y: 0, width: native.width, height: native.height),
+            presentationSize: GeometrySize(width: native.width, height: native.height),
+            pixelAspectRatio: nil,
+            preferredTransform: GeometryTransform(a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0),
+            hasExplicitCleanAperture: false,
+            hasExplicitPixelAspectRatio: false
+        )
+        require(implicitSquare.isCompatibleWithFixedEncoder, "implicit square PAR and full aperture are semantically compatible")
+        let rotated = AerialGeometryProfile(
+            encodedSize: GeometrySize(width: native.width, height: native.height),
+            naturalSize: GeometrySize(width: native.width, height: native.height),
+            cleanAperture: GeometryRect(x: 0, y: 0, width: native.width, height: native.height),
+            presentationSize: GeometrySize(width: native.width, height: native.height),
+            pixelAspectRatio: PixelAspectRatio(horizontal: 1, vertical: 1),
+            preferredTransform: GeometryTransform(a: 0, b: 1, c: -1, d: 0, tx: 0, ty: 0),
+            hasExplicitCleanAperture: true,
+            hasExplicitPixelAspectRatio: true
+        )
+        require(!rotated.isCompatibleWithFixedEncoder, "rotated original geometry must fail closed")
+        let parityDifferences = GeometryDiagnostics.profileDifferences(
+            "final-vs-original", left: customProfile, right: nativeProfile
+        )
+        require(parityDifferences.contains(where: { $0.contains("encodedSize") }), "profile parity must identify the differing field")
+
+        testNativeCanvasStoreMigration(native: native, profile: nativeProfile)
+    }
+
+    private static func profile(for canvas: AerialCanvas) -> AerialGeometryProfile {
+        AerialGeometryProfile(
+            encodedSize: GeometrySize(width: canvas.width, height: canvas.height),
+            naturalSize: GeometrySize(width: canvas.width, height: canvas.height),
+            cleanAperture: GeometryRect(x: 0, y: 0, width: canvas.width, height: canvas.height),
+            presentationSize: GeometrySize(width: canvas.width, height: canvas.height),
+            pixelAspectRatio: PixelAspectRatio(horizontal: 1, vertical: 1),
+            preferredTransform: GeometryTransform(a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0),
+            hasExplicitCleanAperture: true,
+            hasExplicitPixelAspectRatio: true
+        )
+    }
+
+    private static func testNativeCanvasStoreMigration(native: AerialCanvas, profile: AerialGeometryProfile) {
+        let directory = temporaryDirectory()
+        let url = directory.appendingPathComponent("native-canvases.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let legacyJSON = "{\"A\":{\"width\":3840,\"height\":2152}}"
+        try! Data(legacyJSON.utf8).write(to: url)
+        let loaded = try! NativeCanvasStore.load(from: url)
+        require(loaded["A"]?.source == NativeCanvasSource.legacy, "v1 records must migrate as legacy")
+        require(loaded["A"]?.canvas == native, "v1 canvas dimensions must be retained")
+
+        try! NativeCanvasStore.save(
+            NativeCanvasRecord(
+                canvas: native,
+                source: .currentTarget,
+                originalTargetSHA256: String(repeating: "a", count: 64),
+                capturedAt: Date(timeIntervalSince1970: 2),
+                geometry: profile
+            ),
+            uuid: "A",
+            to: url
+        )
+        let migratedData = try! Data(contentsOf: url)
+        let migratedObject = try! JSONSerialization.jsonObject(with: migratedData) as! [String: Any]
+        require(migratedObject["version"] as? Int == 2, "saved records must use v2 envelope")
+        require((migratedObject["records"] as? [String: Any])?["A"] != nil, "saved v2 record must be retained")
+    }
+
+    private static func temporaryDirectory() -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wallpaper-converter-geometry-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
     }
 
     private static func testHorizontalBoundaries(screenAspect: Double, label: String) {

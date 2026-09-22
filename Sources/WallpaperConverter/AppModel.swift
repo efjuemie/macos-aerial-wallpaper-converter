@@ -43,6 +43,22 @@ final class AppModel: ObservableObject {
     @Published var pendingCropSelection: WallpaperCropSelection?
     @Published var showCropSheet = false
     @Published var showEnvironmentActionConfirmation = false
+    @Published var showReidentifyConfirmation = false
+    @Published var isReidentifying = false
+    @Published var lastGeometryDiagnostic: GeometryDiagnosticReport?
+    @Published var geometryDiagnosticURL: URL?
+    @Published var isGeneratingGeometryDiagnostic = false
+    @Published var lastGeometrySummary: String?
+    @Published var lastGeometrySource: String?
+    @Published var geometryPhenomenonChoice = "未观察"
+
+    static let geometryPhenomenonChoices = [
+        "未观察",
+        "A · 最终 MOV 在 QuickTime 已变形",
+        "B · 进入桌面立即变形",
+        "C · 桌面延迟数秒后变形",
+        "D · 仅特定显示器或缩放设置变形"
+    ]
 
     private let logger = AppLogger()
     private var previewTask: Task<Void, Never>?
@@ -84,6 +100,7 @@ final class AppModel: ObservableObject {
             && !isProcessing
             && !isInspectingVideo
             && !isPreparingLayout
+            && !isReidentifying
     }
 
     var selectedTargetExists: Bool {
@@ -261,8 +278,97 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func diagnoseCurrentTarget() {
+        guard let uuid = AerialService.normalizeUUID(uuidText) else {
+            alertMessage = "请输入有效的 Aerial UUID。"
+            return
+        }
+        guard selectedTargetExists else {
+            alertMessage = "请先在系统设置→壁纸中下载动态壁纸。"
+            return
+        }
+        let inputURL = inputInfo?.url
+        isGeneratingGeometryDiagnostic = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isGeneratingGeometryDiagnostic = false }
+            do {
+                var report = try await AerialService.diagnoseCurrentTarget(
+                    uuid: uuid,
+                    inputURL: inputURL
+                )
+                guard AerialService.normalizeUUID(self.uuidText) == uuid else { return }
+                report.phenomenon = self.geometryPhenomenonChoice
+                self.lastGeometryDiagnostic = report
+                let url = try GeometryDiagnostics.export(report)
+                self.geometryDiagnosticURL = url
+                self.logger.write("Geometry diagnostic exported uuid=\(uuid) report=\(url.lastPathComponent) \(report.summary)")
+                self.alertMessage = "诊断报告已导出：\n\(url.path)"
+            } catch {
+                self.alertMessage = "无法生成几何诊断：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func exportGeometryDiagnostic() {
+        guard var report = lastGeometryDiagnostic else {
+            diagnoseCurrentTarget()
+            return
+        }
+        do {
+            report.phenomenon = geometryPhenomenonChoice
+            lastGeometryDiagnostic = report
+            let url = try GeometryDiagnostics.export(report)
+            geometryDiagnosticURL = url
+            alertMessage = "诊断报告已导出：\n\(url.path)"
+        } catch {
+            alertMessage = "无法导出诊断报告：\(error.localizedDescription)"
+        }
+    }
+
+    func openDiagnosticsFolder() {
+        do {
+            try AppPaths.ensureDirectory(GeometryDiagnostics.directory)
+            NSWorkspace.shared.open(GeometryDiagnostics.directory)
+        } catch {
+            alertMessage = "无法打开诊断文件夹：\(error.localizedDescription)"
+        }
+    }
+
+    func reidentifyDownloadedOriginal() {
+        guard !isProcessing, !isPreparingLayout, !isGeneratingGeometryDiagnostic, !isReidentifying else { return }
+        guard let uuid = AerialService.normalizeUUID(uuidText) else {
+            alertMessage = "请输入有效的动态壁纸 UUID。"
+            return
+        }
+        isReidentifying = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isReidentifying = false }
+            do {
+                let canvas = try await AerialService.reidentifyDownloadedOriginal(uuid: uuid)
+                guard AerialService.normalizeUUID(self.uuidText) == uuid else { return }
+                self.pendingCropSelection = nil
+                self.showCropSheet = false
+                self.showProcessConfirmation = false
+                self.lastGeometryDiagnostic = nil
+                self.geometryDiagnosticURL = nil
+                self.lastGeometrySummary = "已重新识别原生画布：\(canvas.width) × \(canvas.height)"
+                self.alertMessage = "原生画布记录已更新。旧记录已备份到诊断文件夹。"
+                self.logger.write("Reidentified downloaded original uuid=\(uuid) canvas=\(canvas.width)x\(canvas.height)")
+            } catch {
+                self.alertMessage = "重新识别失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
     func selectTarget(_ uuid: String) {
         guard !uuid.isEmpty else { return }
+        if selectedUUID != uuid {
+            lastGeometryDiagnostic = nil
+            geometryDiagnosticURL = nil
+            lastGeometrySummary = nil
+        }
         uuidText = uuid
         selectedUUID = uuid
         backups = AerialService.backups(for: uuid)
@@ -270,12 +376,18 @@ final class AppModel: ObservableObject {
 
     func uuidFieldChanged() {
         if let uuid = AerialService.normalizeUUID(uuidText) {
+            if selectedUUID != uuid {
+                lastGeometryDiagnostic = nil
+                geometryDiagnosticURL = nil
+                lastGeometrySummary = nil
+            }
             selectedUUID = uuid
             backups = AerialService.backups(for: uuid)
         }
     }
 
     func requestProcessing() {
+        guard !isReidentifying else { return }
         guard let values = validatedProcessingValues() else { return }
         let target: URL
         do {
@@ -291,13 +403,18 @@ final class AppModel: ObservableObject {
         isPreparingLayout = true
         Task {
             do {
-                let canvas = try await AerialService.outputCanvas(for: target, uuid: values.uuid)
+                let resolution = try await AerialService.outputCanvasResolution(for: target, uuid: values.uuid)
+                let canvas = resolution.canvas
+                lastGeometrySummary = "目标画布 \(canvas.width) × \(canvas.height)；来源 \(resolution.source.displayName)"
+                lastGeometrySource = resolution.source.rawValue
                 guard let layout = wallpaperLayout(for: values.input, outputCanvas: canvas) else {
                     throw AppError("无法读取主显示器尺寸，不能安全生成壁纸画布。")
                 }
                 pendingCropSelection = layout
                 logger.write(
                     "Prepared canvas uuid=\(values.uuid) output=\(canvas.width)x\(canvas.height) " +
+                    "source=\(resolution.source.rawValue) evidence=\(resolution.evidence) " +
+                    "conflicts=\(resolution.conflicts.joined(separator: ";")) " +
                     "visibleCrop=\(Int(layout.cropWidth))x\(Int(layout.cropHeight))"
                 )
                 if requiresCrop(for: values.input) {
@@ -340,6 +457,7 @@ final class AppModel: ObservableObject {
     }
 
     func startProcessing() {
+        guard !isReidentifying else { return }
         guard let values = validatedProcessingValues() else { return }
         guard let layout = pendingCropSelection else {
             alertMessage = "目标壁纸画布尚未准备完成，请重新点击“处理并替换”。"
@@ -528,6 +646,8 @@ final class AppModel: ObservableObject {
         isProcessing = true
         phase = .running(number: 1, title: "替换历史动态壁纸", detail: "正在备份当前动态壁纸并安装历史版本…")
         lastReport = nil
+        lastGeometryDiagnostic = nil
+        geometryDiagnosticURL = nil
 
         Task {
             do {
@@ -675,6 +795,8 @@ final class AppModel: ObservableObject {
             detail: "正在检查系统版本、内置编码器、动态壁纸目录和磁盘空间…"
         )
         lastReport = nil
+        lastGeometryDiagnostic = nil
+        geometryDiagnosticURL = nil
 
         var didComplete = false
         Task {
@@ -699,10 +821,17 @@ final class AppModel: ObservableObject {
                 logger.write("Start input=\(input.url.path) uuid=\(uuid) duration=\(input.duration) loopCount=\(loopCount) bitrate=\(bitrate)")
                 progress = 3
 
+                var geometryReport: GeometryDiagnosticReport?
+                do {
+                    geometryReport = try await AerialService.diagnoseCurrentTarget(uuid: uuid, inputURL: input.url)
+                } catch {
+                    logger.write("Geometry diagnostic before encoding unavailable: \(error.localizedDescription)")
+                }
+
                 let aspectDetail = "按屏幕可见区域取景，并生成 \(cropSelection.outputWidth) × \(cropSelection.outputHeight) 的目标 Aerial 画布。"
                 phase = .running(number: 4, title: "编码动态壁纸视频", detail: "正在生成 HEVC Main 10 输出，\(aspectDetail)")
                 let output = try processedOutputURL(uuid: uuid)
-                let geometryValidation = try await EncoderService.encode(
+                let geometryResult = try await EncoderService.encodeWithEvidence(
                     input: input.url,
                     output: output,
                     loopCount: loopCount,
@@ -710,7 +839,10 @@ final class AppModel: ObservableObject {
                     executable: encoder,
                     cropSelection: cropSelection
                 )
-                logger.write("Geometry validation output=\(output.path): \(geometryValidation)")
+                logger.write("Geometry validation output=\(output.path): \(geometryResult.validation)")
+                geometryReport?.intermediate = geometryResult.intermediate
+                geometryReport?.finalOutput = geometryResult.finalOutput
+                geometryReport?.finalOutputSHA256 = try? AerialService.sha256(output)
                 progress = 4
 
                 phase = .running(number: 5, title: "验证输出兼容性", detail: "画布几何已固定；继续检查 tscl 和 tsas 四项标记。")
@@ -746,6 +878,44 @@ final class AppModel: ObservableObject {
                 } catch {
                     try? AerialService.replaceAtomically(source: backup, target: target)
                     throw error
+                }
+                geometryReport?.installedTarget = await VideoGeometryService.diagnosticSnapshot(at: target)
+                geometryReport?.installedTargetSHA256 = try? AerialService.sha256(target)
+                geometryReport?.outputMatchesInstalledTarget = geometryReport?.installedTargetSHA256 == sourceHash
+                if var report = geometryReport {
+                    let originalProfile = GeometryDiagnostics.originalReferenceProfile(
+                        chosenSource: report.chosenSource,
+                        targetHash: report.targetBeforeSHA256,
+                        targetProfile: report.targetBefore?.profile,
+                        persistedRecord: report.persistedRecord,
+                        archiveProfile: report.referenceOriginal?.profile
+                    )
+                    report.diffs += GeometryDiagnostics.profileDifferences(
+                        "target-before-vs-original", left: report.targetBefore?.profile, right: originalProfile
+                    )
+                    report.diffs += GeometryDiagnostics.profileDifferences(
+                        "final-vs-original", left: report.finalOutput?.profile, right: originalProfile
+                    )
+                    report.diffs += GeometryDiagnostics.profileDifferences(
+                        "intermediate-vs-final", left: report.intermediate?.profile, right: report.finalOutput?.profile
+                    )
+                    report.diffs += GeometryDiagnostics.profileDifferences(
+                        "final-vs-installed", left: report.finalOutput?.profile, right: report.installedTarget?.profile
+                    )
+                    if originalProfile == nil {
+                        report.notes.append("未取得可比对的 Apple 原壁纸几何 profile。")
+                    }
+                    geometryReport = report
+                }
+                if var geometryReport {
+                    geometryReport.phenomenon = geometryPhenomenonChoice
+                    lastGeometryDiagnostic = geometryReport
+                    do {
+                        geometryDiagnosticURL = try GeometryDiagnostics.export(geometryReport)
+                    } catch {
+                        logger.write("Geometry diagnostic export failed: \(error.localizedDescription)")
+                    }
+                    logger.write(geometryReport.geometryLogSummary)
                 }
                 let encodedArchive: URL?
                 do {

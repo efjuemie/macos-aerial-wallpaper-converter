@@ -6,7 +6,7 @@
 
 ### 普通用户（推荐）
 
-普通用户无需 clone 源码。正式发行包发布在本仓库的 [Releases](https://github.com/efjuemie/macos-aerial-wallpaper-converter/releases) 页面，请下载与设备匹配的 Apple Silicon DMG 或 ZIP。
+普通用户无需 clone 源码。发行包发布在本仓库的 [Releases](https://github.com/efjuemie/macos-aerial-wallpaper-converter/releases) 页面，请下载与设备匹配的 Apple Silicon DMG 或 ZIP。`v0.8.1` 是用于跨设备几何诊断的预发布版本；它不会宣称已经在所有 Mac 上解决“进入桌面后被压扁”。
 
 安装步骤：
 
@@ -37,11 +37,53 @@
 1. 打开应用，等待“环境检查”完成；按提示修复红色的运行环境项目。
 2. 将 `.mov`、`.mp4` 或 `.m4v` 视频拖入窗口，或点击“选择文件”。
 3. 选择已下载的目标动态壁纸，确认 UUID、目标时长和码率。
-4. 如视频比例不同，拖动裁剪框；不调整则使用居中裁剪。
-5. 点击“处理并替换”并确认。应用会使用内置 arm64 VideoToolbox 编码器，验证画布元数据和四项 temporal sample groups 后才会安装。
-6. 完成后在系统设置中重新点击对应动态壁纸，并连续测试 5 次“锁屏 → 解锁”。
+4. 如果是升级安装、曾经遇到桌面变形，或准备反馈问题，先选择观察到的现象并点击“诊断当前目标”；报告会自动导出，也可修改现象分类后再次导出。诊断只读当前目标、视频几何和显示器信息，不编码、备份、替换或重载 WallpaperAgent。
+5. 如视频比例不同，拖动裁剪框；不调整则使用居中裁剪。
+6. 点击“处理并替换”并确认。应用会使用内置 arm64 VideoToolbox 编码器，验证画布元数据和四项 temporal sample groups 后才会安装。
+7. 完成后在系统设置中重新点击对应动态壁纸，并在受影响的设备上连续完成至少 5 次“锁屏 → 解锁”，同时观察解锁后立即和等待约 5 秒后的桌面画面。
 
-桌面保持静态是 macOS 的正常现象；若出现黑屏、冻结或第二次不播放，请在应用中恢复备份。
+桌面保持静态是 macOS 的正常现象；若出现黑屏、冻结或第二次不播放，请在应用中恢复备份。只有受影响设备完成上述 5 次循环且圆形、方形和人物比例均正常，才能把该设备视为回归通过；在此之前不要把 v0.8.1 当作完整桌面变形修复。
+
+## v0.8.1 几何诊断与预发布说明
+
+### 导出只读诊断报告
+
+主界面的“诊断当前目标”会收集当前 UUID 的 Apple Aerial 文件、已选输入视频（如有）、原生画布证据和所有显示器几何；“导出诊断报告”写入本地：
+
+```text
+~/Library/Application Support/WallpaperConverter/Diagnostics/YYYYMMDD-HHmmss-geometry.json
+```
+
+报告不会自动上传。它包含应用/系统版本、架构、显示器点尺寸和像素尺寸、输入视频文件名（仅 basename）、大小/时长，以及用于完整性比对的 SHA-256。报告还可能包含历史归档文件名；分享前请检查内容并自行删去不想公开的信息。应用不收集用户姓名、Apple ID 或其他无关身份信息。
+
+报告中的几何证据包括：
+
+- 替换前目标 Apple Aerial 的 encoded、natural、clean aperture、presentation、像素宽高比和 preferred transform，以及目标 SHA-256；
+- native canvas 的选择来源和冲突信息；
+- 屏幕比例、输入/输出画布、crop origin、uniform placement scale、translation 和预测可见区域；
+- 处理流程中的中间裁剪文件和最终 HEVC 输出几何；
+- 安装后目标文件几何、安装后 SHA-256，以及输出与安装目标是否一致。
+
+该报告能区分“最终 MOV 自身变形”和“最终文件正常但桌面层变形”，但不能单凭报告证明 WallpaperAgent 在每台设备上都会正确显示。遇到桌面压扁时，请保留报告、日志和测试阶段，不要只以开发者机器正常作为结论。
+
+### 原生画布记录的安全迁移
+
+`native-canvases.json` 的旧 v1 格式只有每个 UUID 的 `width`/`height`，没有原始文件来源、SHA-256 或完整 geometry profile。v0.8.1 可以读取它，但会把 v1 记录标记为“旧版未验证记录”；它不能作为可信证据覆盖当前 Apple 原文件或可交叉验证的历史原件。
+
+v0.8.1 保存的新记录使用 v2 版本封装，包含画布、来源、原始目标 SHA-256、采集时间和 geometry profile。首次使用且没有应用历史时，几何合法的当前 Apple 目标文件优先；已有历史时优先使用带 provenance 的可信 v2 记录，或在最早原壁纸归档与最早备份的 geometry 一致时使用历史共识。系统清单推断仅作低可信 fallback。
+
+如果可信证据相互冲突且无法判定，或历史原件/最早备份不足以交叉验证且没有可用的清单候选，应用会停止替换（fail closed）。若只能依据系统清单推断，界面会标明这是低可信 fallback。请按以下顺序处理：
+
+1. 先导出几何诊断报告和日志。
+2. 将旧的 `native-canvases.json`、原壁纸归档和应用备份复制到安全位置留存；不要直接删除历史记录，也不要用当前可能已经被替换的输出重新学习原生画布。
+3. 在系统设置中重新下载对应的 Apple 动态壁纸，或在应用中恢复可信的原壁纸/备份；确保同一 UUID 的最早原件与最早备份完整且画布一致后再重试。
+4. 若仍无法建立可信证据，请把诊断 JSON、相关日志和冲突信息一起提交，而不是绕过检查或强行替换。
+
+高级恢复入口“重新识别原壁纸”只适用于已经在系统设置中重新下载、且确认是同一 UUID 的 Apple 动态壁纸。确认后，应用会先备份旧的 `native-canvases.json`，再读取当前目标的 SHA-256 和 geometry profile，保存新的 v2 provenance 记录；此操作本身不编码、不替换壁纸，也不会删除原壁纸归档或应用备份。完成后请重新导出诊断并再次发起处理。若没有任何历史记录且本机目标几何暂时不可读，系统 manifest 只能作为安全的低可信 fallback，仍不应把它当作已经验证的原生画布。
+
+### 多显示器限制
+
+如果存在多块且宽高比不同的显示器，诊断报告会明确记录警告；当前裁剪以主显示器为基准，而同一个共享 Aerial UUID 不能为每块屏幕写入不同视频。macOS 可能对其他显示器执行不同裁切，因此请在异常复测时记录主显示器、外接屏、缩放设置和合盖状态，不要把 `NSScreen.main` 当作所有壁纸显示器的绝对几何。
 
 ## 环境检查与修复
 
@@ -65,11 +107,12 @@ Git、Python 3、Swift 和 Command Line Tools 位于折叠的“开发工具”�
 - 使用目标 Aerial 的可信原生画布，保留 crop 映射、fixed canvas、显式 clean aperture、1:1 像素宽高比和恒等 transform 校验。
 - 安装前保存应用备份和“壁纸”目录中的连续编号原壁纸归档；成功安装的新编码视频也保存到“已编码”历史。
 - 输出先写临时文件，完成 SHA-256 校验后原子替换；安装失败会尝试回滚到备份。
+- 处理前可导出只读几何诊断；成功处理还会记录中间裁剪、最终输出和安装后目标的 geometry/SHA-256 证据。
 - WallpaperAgent 最多只重载一次；应用不常驻后台，不使用 `killall WallpaperAerialsExtension`，不要求 root，不修改 SIP 或系统保护目录。
 
 ## 完整处理流程
 
-应用先准备裁剪布局和目标原生画布，然后验证内置 `Encoder/bin/encode_temporal` 的存在、可执行权限、arm64 架构和 manifest 中的 SHA-256。接着执行 HEVC temporal 编码，检查输出几何（encoded、natural、clean aperture、presentation）、显式元数据和四项 sample group。所有检查通过后才确认目标文件、创建备份与归档，再执行 SHA-256 校验和临时文件原子替换。
+应用先准备裁剪布局和目标原生画布，并在处理前读取目标几何作为诊断证据；然后验证内置 `Encoder/bin/encode_temporal` 的存在、可执行权限、arm64 架构和 manifest 中的 SHA-256。接着执行 HEVC temporal 编码，记录中间裁剪文件和最终输出，检查输出几何（encoded、natural、clean aperture、presentation）、显式元数据和四项 sample group。所有检查通过后才确认目标文件、创建备份与归档，再执行 SHA-256 校验和临时文件原子替换，最后读取安装后目标并将其与输出比对。
 
 任一关键检查失败都会停止安装，原始目标文件保持不变。上游 `groups.py` 仍随源码保留作参考和许可证合规用途，但普通运行不调用它。
 
@@ -84,6 +127,7 @@ Git、Python 3、Swift 和 Command Line Tools 位于折叠的“开发工具”�
 - 原壁纸归档：`~/Library/Application Support/WallpaperConverter/壁纸/`；
 - 已编码历史：`~/Library/Application Support/WallpaperConverter/壁纸/已编码/`；
 - 原生画布记录：`~/Library/Application Support/WallpaperConverter/native-canvases.json`；
+- 几何诊断 JSON：`~/Library/Application Support/WallpaperConverter/Diagnostics/`；
 - 日志：`~/Library/Logs/WallpaperConverter.log`。
 
 目标 Apple 动态壁纸位于：
@@ -108,7 +152,15 @@ Git、Python 3、Swift 和 Command Line Tools 位于折叠的“开发工具”�
 
 ### 为什么桌面不动或锁屏黑屏？
 
-请在系统设置中重新点击对应动态壁纸并连续测试 5 次锁屏→解锁。若仍异常，先在应用中恢复备份；不要运行常驻杀进程脚本。
+请在系统设置中重新点击对应动态壁纸并连续测试 5 次锁屏→解锁，观察解锁后立即和约 5 秒后的桌面画面。若仍异常，先导出“几何诊断报告”，再在应用中恢复备份；不要运行常驻杀进程脚本。v0.8.1 是诊断预发布版本，尚不能据此宣称所有设备的桌面变形问题已经解决。
+
+### 如何反馈桌面压扁问题？
+
+在异常设备上选择目标 UUID，并在“实际观察到的现象”中选择 A（最终 MOV 已变形）、B（进入桌面立即变形）、C（桌面延迟数秒后变形）或 D（仅特定显示器/缩放设置变形），再点击“诊断当前目标”；它会自动导出只读报告，不会替换壁纸。保留 `Diagnostics/YYYYMMDD-HHmmss-geometry.json`、`~/Library/Logs/WallpaperConverter.log` 和 5 次锁屏→解锁的结果。若最终 MOV 在 QuickTime 中正常但桌面仍变形，请明确记录锁屏阶段、解锁末尾、桌面立即显示和等待 5 秒后的现象，并附上显示器数量/比例与缩放设置。
+
+### 为什么提示无法可靠判定原生画布？
+
+这表示应用无法用当前目标和可信历史证据交叉验证原生画布，或者发现 v1 旧记录、manifest 与原件冲突。应用会停止替换以避免继续污染历史。先导出诊断并备份旧记录，再在系统设置中重新下载同一 Apple 动态壁纸；确认后才可使用“重新识别原壁纸”高级入口。该入口只备份旧记录并写入新的 v2 证据，不替换壁纸。不要直接删除 `native-canvases.json`、原壁纸归档或备份，也不要把已编码输出当作原始 Apple 文件。
 
 ### 为什么首次打开被 macOS 拦截？
 
@@ -151,4 +203,4 @@ macOS 版 Wallpaper Engine 通常不能直接运行，可在 Windows 或 Windows
 
 ## 版本
 
-当前源码版本为 **0.8.0**，完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前源码版本为 **0.8.1（build 9，诊断预发布）**，完整记录见 [CHANGELOG.md](CHANGELOG.md)。

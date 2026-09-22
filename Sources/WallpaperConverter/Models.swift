@@ -38,45 +38,369 @@ struct AerialCanvas: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+struct GeometrySize: Codable, Equatable, Sendable {
+    let width: Double
+    let height: Double
+
+    init(width: Int, height: Int) {
+        self.width = Double(width)
+        self.height = Double(height)
+    }
+
+    init(width: Double, height: Double) {
+        self.width = width
+        self.height = height
+    }
+
+    var integerCanvas: AerialCanvas? {
+        let roundedWidth = Int(width.rounded())
+        let roundedHeight = Int(height.rounded())
+        guard abs(width - Double(roundedWidth)) < 0.01,
+              abs(height - Double(roundedHeight)) < 0.01,
+              roundedWidth > 1,
+              roundedHeight > 1,
+              roundedWidth.isMultiple(of: 2),
+              roundedHeight.isMultiple(of: 2) else {
+            return nil
+        }
+        return AerialCanvas(width: roundedWidth, height: roundedHeight)
+    }
+}
+
+struct GeometryRect: Codable, Equatable, Sendable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+
+    init(x: Double, y: Double, width: Int, height: Int) {
+        self.x = x
+        self.y = y
+        self.width = Double(width)
+        self.height = Double(height)
+    }
+
+    init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+struct PixelAspectRatio: Codable, Equatable, Sendable {
+    let horizontal: Int
+    let vertical: Int
+}
+
+struct GeometryTransform: Codable, Equatable, Sendable {
+    let a: Double
+    let b: Double
+    let c: Double
+    let d: Double
+    let tx: Double
+    let ty: Double
+
+    var isIdentity: Bool {
+        approximatelyEqual(a, 1)
+            && approximatelyEqual(b, 0)
+            && approximatelyEqual(c, 0)
+            && approximatelyEqual(d, 1)
+            && approximatelyEqual(tx, 0)
+            && approximatelyEqual(ty, 0)
+    }
+
+    private func approximatelyEqual(_ left: Double, _ right: Double) -> Bool {
+        abs(left - right) < 0.01
+    }
+}
+
+struct AerialGeometryProfile: Codable, Equatable, Sendable {
+    let encodedSize: GeometrySize
+    let naturalSize: GeometrySize
+    let cleanAperture: GeometryRect
+    let presentationSize: GeometrySize
+    let pixelAspectRatio: PixelAspectRatio?
+    let preferredTransform: GeometryTransform
+    let hasExplicitCleanAperture: Bool
+    let hasExplicitPixelAspectRatio: Bool
+
+    var canvas: AerialCanvas? { encodedSize.integerCanvas }
+
+    var isCompatibleWithFixedEncoder: Bool {
+        guard let canvas,
+              approximatelyEqual(naturalSize.width, Double(canvas.width)),
+              approximatelyEqual(naturalSize.height, Double(canvas.height)),
+              approximatelyEqual(cleanAperture.x, 0),
+              approximatelyEqual(cleanAperture.y, 0),
+              approximatelyEqual(cleanAperture.width, Double(canvas.width)),
+              approximatelyEqual(cleanAperture.height, Double(canvas.height)),
+              approximatelyEqual(presentationSize.width, Double(canvas.width)),
+              approximatelyEqual(presentationSize.height, Double(canvas.height)),
+              preferredTransform.isIdentity,
+              (pixelAspectRatio == nil || pixelAspectRatio?.horizontal == 1 && pixelAspectRatio?.vertical == 1) else {
+            return false
+        }
+        return true
+    }
+
+    func matchesCanvas(_ canvas: AerialCanvas) -> Bool {
+        self.canvas == canvas && isCompatibleWithFixedEncoder
+    }
+
+    var compactDescription: String {
+        let encoded = "\(Int(encodedSize.width.rounded()))x\(Int(encodedSize.height.rounded()))"
+        let natural = "\(Int(naturalSize.width.rounded()))x\(Int(naturalSize.height.rounded()))"
+        let clean = "\(Int(cleanAperture.width.rounded()))x\(Int(cleanAperture.height.rounded()))@\(Int(cleanAperture.x.rounded())),\(Int(cleanAperture.y.rounded()))"
+        let presentation = "\(Int(presentationSize.width.rounded()))x\(Int(presentationSize.height.rounded()))"
+        let par = pixelAspectRatio.map { "\($0.horizontal):\($0.vertical)" } ?? "implicit"
+        let transform = preferredTransform.isIdentity ? "identity" : "custom"
+        return "encoded=\(encoded), natural=\(natural), clean=\(clean), presentation=\(presentation), par=\(par), transform=\(transform)"
+    }
+
+    func differences(from other: AerialGeometryProfile) -> [String] {
+        var differences: [String] = []
+        appendSizeDifference(
+            "encodedSize",
+            left: encodedSize,
+            right: other.encodedSize,
+            to: &differences
+        )
+        appendSizeDifference(
+            "naturalSize",
+            left: naturalSize,
+            right: other.naturalSize,
+            to: &differences
+        )
+        appendRectDifference(
+            "cleanAperture",
+            left: cleanAperture,
+            right: other.cleanAperture,
+            to: &differences
+        )
+        appendSizeDifference(
+            "presentationSize",
+            left: presentationSize,
+            right: other.presentationSize,
+            to: &differences
+        )
+        if pixelAspectRatio != other.pixelAspectRatio {
+            let leftPAR = pixelAspectRatio.map { "\($0.horizontal):\($0.vertical)" } ?? "implicit"
+            let rightPAR = other.pixelAspectRatio.map { "\($0.horizontal):\($0.vertical)" } ?? "implicit"
+            differences.append("pixelAspectRatio=\(leftPAR) vs \(rightPAR)")
+        }
+        if preferredTransform != other.preferredTransform {
+            differences.append("preferredTransform differs")
+        }
+        if hasExplicitCleanAperture != other.hasExplicitCleanAperture {
+            differences.append("hasExplicitCleanAperture=\(hasExplicitCleanAperture) vs \(other.hasExplicitCleanAperture)")
+        }
+        if hasExplicitPixelAspectRatio != other.hasExplicitPixelAspectRatio {
+            differences.append("hasExplicitPixelAspectRatio=\(hasExplicitPixelAspectRatio) vs \(other.hasExplicitPixelAspectRatio)")
+        }
+        return differences
+    }
+
+    private func appendSizeDifference(
+        _ name: String,
+        left: GeometrySize,
+        right: GeometrySize,
+        to differences: inout [String]
+    ) {
+        guard !approximatelyEqual(left.width, right.width)
+                || !approximatelyEqual(left.height, right.height) else {
+            return
+        }
+        differences.append(
+            "\(name)=\(Int(left.width.rounded()))x\(Int(left.height.rounded())) vs " +
+            "\(Int(right.width.rounded()))x\(Int(right.height.rounded()))"
+        )
+    }
+
+    private func appendRectDifference(
+        _ name: String,
+        left: GeometryRect,
+        right: GeometryRect,
+        to differences: inout [String]
+    ) {
+        guard !approximatelyEqual(left.x, right.x)
+                || !approximatelyEqual(left.y, right.y)
+                || !approximatelyEqual(left.width, right.width)
+                || !approximatelyEqual(left.height, right.height) else {
+            return
+        }
+        differences.append(
+            "\(name)=(\(Int(left.x.rounded())),\(Int(left.y.rounded())),\(Int(left.width.rounded()))x\(Int(left.height.rounded()))) vs " +
+            "(\(Int(right.x.rounded())),\(Int(right.y.rounded())),\(Int(right.width.rounded()))x\(Int(right.height.rounded())))"
+        )
+    }
+
+    private func approximatelyEqual(_ left: Double, _ right: Double) -> Bool {
+        abs(left - right) < 0.01
+    }
+}
+
+enum NativeCanvasSource: String, Codable, Equatable, Sendable {
+    case currentTarget
+    case reidentified
+    case persisted
+    case historyConsensus
+    case manifest
+    case legacy
+
+    var displayName: String {
+        switch self {
+        case .currentTarget: return "当前 Apple 原壁纸"
+        case .reidentified: return "用户确认重新下载的原壁纸"
+        case .persisted: return "已保存的可信记录"
+        case .historyConsensus: return "历史原件共识"
+        case .manifest: return "系统清单推断"
+        case .legacy: return "旧版未验证记录"
+        }
+    }
+
+    var isFallback: Bool {
+        self == .manifest || self == .legacy
+    }
+}
+
+struct NativeCanvasRecord: Codable, Equatable, Sendable {
+    let canvas: AerialCanvas
+    let source: NativeCanvasSource
+    let originalTargetSHA256: String?
+    let capturedAt: Date?
+    let geometry: AerialGeometryProfile?
+
+    var isTrusted: Bool {
+        (source == .currentTarget || source == .reidentified || source == .historyConsensus)
+            && originalTargetSHA256?.count == 64
+            && originalTargetSHA256?.allSatisfy({ $0.isHexDigit }) == true
+            && geometry?.matchesCanvas(canvas) == true
+    }
+
+    static func legacy(canvas: AerialCanvas) -> NativeCanvasRecord {
+        NativeCanvasRecord(
+            canvas: canvas,
+            source: .legacy,
+            originalTargetSHA256: nil,
+            capturedAt: nil,
+            geometry: nil
+        )
+    }
+}
+
 struct NativeCanvasResolution: Equatable, Sendable {
     let canvas: AerialCanvas
+    let source: NativeCanvasSource
     let shouldPersist: Bool
+    let evidence: String
+    let conflicts: [String]
+    let profile: AerialGeometryProfile?
+    let originalTargetSHA256: String?
 }
 
 enum NativeCanvasResolver {
     static func resolve(
-        persistedCanvas: AerialCanvas?,
+        persistedRecord: NativeCanvasRecord?,
         manifestCanvas: AerialCanvas?,
-        targetCanvas: AerialCanvas?,
+        targetProfile: AerialGeometryProfile?,
         hasAnyHistoricalRecords: Bool,
-        earliestOriginalCanvas: AerialCanvas?,
-        earliestBackupCanvas: AerialCanvas?
+        earliestOriginalProfile: AerialGeometryProfile?,
+        earliestBackupProfile: AerialGeometryProfile?,
+        earliestOriginalSHA256: String? = nil
     ) -> NativeCanvasResolution? {
-        if let manifestCanvas, isValid(manifestCanvas) {
+        let hasHistory = hasAnyHistoricalRecords || persistedRecord != nil
+        var conflicts: [String] = []
+        if let manifestCanvas,
+           let targetCanvas = targetProfile?.canvas,
+           manifestCanvas != targetCanvas {
+            conflicts.append("manifest=\(manifestCanvas.width)x\(manifestCanvas.height) target=\(targetCanvas.width)x\(targetCanvas.height)")
+        }
+
+        if !hasHistory,
+           let targetProfile,
+           let targetCanvas = targetProfile.canvas,
+           targetProfile.isCompatibleWithFixedEncoder {
             return NativeCanvasResolution(
-                canvas: manifestCanvas,
-                shouldPersist: persistedCanvas != manifestCanvas
+                canvas: targetCanvas,
+                source: .currentTarget,
+                shouldPersist: true,
+                evidence: "trusted current target geometry",
+                conflicts: conflicts,
+                profile: targetProfile,
+                originalTargetSHA256: nil
             )
         }
-        if let persistedCanvas, isValid(persistedCanvas) {
-            return NativeCanvasResolution(canvas: persistedCanvas, shouldPersist: false)
+
+        if hasHistory,
+           let persistedRecord,
+           persistedRecord.isTrusted {
+            var persistedConflicts = conflicts
+            if persistedRecord.source != .reidentified,
+               let earliestOriginalSHA256,
+               earliestOriginalSHA256.caseInsensitiveCompare(persistedRecord.originalTargetSHA256 ?? "") != .orderedSame {
+                persistedConflicts.append("persisted original SHA-256 differs from earliest original archive")
+            }
+            if persistedRecord.source != .reidentified,
+               let original = earliestOriginalProfile?.canvas,
+               original != persistedRecord.canvas {
+                persistedConflicts.append("persisted=\(persistedRecord.canvas.width)x\(persistedRecord.canvas.height) earliestOriginal=\(original.width)x\(original.height)")
+            }
+            if persistedRecord.source != .reidentified,
+               let backup = earliestBackupProfile?.canvas,
+               backup != persistedRecord.canvas {
+                persistedConflicts.append("persisted=\(persistedRecord.canvas.width)x\(persistedRecord.canvas.height) earliestBackup=\(backup.width)x\(backup.height)")
+            }
+            if persistedConflicts.isEmpty || persistedConflicts.allSatisfy({ $0.hasPrefix("manifest=") }) {
+                return NativeCanvasResolution(
+                    canvas: persistedRecord.canvas,
+                    source: .persisted,
+                    shouldPersist: false,
+                    evidence: "trusted v2 record with original SHA-256 and geometry profile",
+                    conflicts: persistedConflicts,
+                    profile: persistedRecord.geometry,
+                    originalTargetSHA256: persistedRecord.originalTargetSHA256
+                )
+            }
+            conflicts = persistedConflicts
         }
-        if !hasAnyHistoricalRecords,
-           let targetCanvas,
-           isValid(targetCanvas) {
-            return NativeCanvasResolution(canvas: targetCanvas, shouldPersist: true)
-        }
-        if hasAnyHistoricalRecords,
-           let earliestOriginalCanvas,
-           let earliestBackupCanvas,
-           earliestOriginalCanvas == earliestBackupCanvas,
-           isValid(earliestOriginalCanvas) {
+
+        if hasHistory,
+           let earliestOriginalProfile,
+           let earliestBackupProfile,
+           let originalCanvas = earliestOriginalProfile.canvas,
+           originalCanvas == earliestBackupProfile.canvas,
+           earliestOriginalProfile.isCompatibleWithFixedEncoder,
+           earliestBackupProfile.isCompatibleWithFixedEncoder,
+           earliestOriginalProfile == earliestBackupProfile {
             return NativeCanvasResolution(
-                canvas: earliestOriginalCanvas,
-                shouldPersist: true
+                canvas: originalCanvas,
+                source: .historyConsensus,
+                shouldPersist: true,
+                evidence: "earliest original archive and earliest backup agree",
+                conflicts: conflicts,
+                profile: earliestOriginalProfile,
+                originalTargetSHA256: earliestOriginalSHA256
             )
         }
-        return nil
+
+        guard (hasHistory || targetProfile == nil),
+              (earliestOriginalProfile == nil || earliestBackupProfile == nil),
+              let manifestCanvas,
+              isValid(manifestCanvas) else {
+            return nil
+        }
+        return NativeCanvasResolution(
+            canvas: manifestCanvas,
+            source: .manifest,
+            shouldPersist: false,
+            evidence: hasHistory
+                ? "manifest fallback; current target is not trusted after prior use"
+                : "manifest fallback; local target geometry unavailable",
+            conflicts: conflicts,
+            profile: nil,
+            originalTargetSHA256: nil
+        )
     }
 
     private static func isValid(_ canvas: AerialCanvas) -> Bool {

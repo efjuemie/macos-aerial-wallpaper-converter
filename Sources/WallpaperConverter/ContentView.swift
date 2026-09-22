@@ -60,6 +60,16 @@ struct ContentView: View {
         } message: {
             Text(model.environmentActionConfirmationMessage)
         }
+        .confirmationDialog(
+            "确认重新识别系统原壁纸？",
+            isPresented: $model.showReidentifyConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("我已重新下载，重新识别") { model.reidentifyDownloadedOriginal() }
+            Button("取消", role: .cancel) { }
+        } message: {
+            Text("仅在你已从系统设置重新下载当前 UUID 对应的 Apple 动态壁纸后使用。应用会备份旧画布记录，再把当前文件识别为原件；不会替换壁纸。若当前仍是自定义视频，请取消。")
+        }
         .onChange(of: scenePhase) { phase in
             if phase == .active {
                 model.refresh()
@@ -186,6 +196,7 @@ struct ContentView: View {
                     .onChange(of: model.selectedUUID) { value in
                         model.selectTarget(value)
                     }
+                    .disabled(model.isReidentifying || model.isPreparingLayout)
                     Spacer()
                 }
             }
@@ -211,6 +222,7 @@ struct ContentView: View {
                     model.uuidFieldChanged()
                 })
                 .textFieldStyle(.roundedBorder)
+                .disabled(model.isReidentifying || model.isPreparingLayout)
                 Image(systemName: model.selectedTargetExists ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                     .foregroundStyle(model.selectedTargetExists ? .green : .orange)
                 Text(model.selectedTargetExists ? "目标文件存在" : "目标文件不存在")
@@ -220,6 +232,11 @@ struct ContentView: View {
             Text("默认目标：\(AppModel.defaultUUID)。如果不存在，请先在系统设置→壁纸中下载并应用对应动态壁纸。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let warning = GeometryDiagnostics.displayAspectWarning() {
+                Text(warning)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
     }
 
@@ -394,6 +411,9 @@ struct ContentView: View {
                         Text("应用备份：\(report.backupURL.path)")
                         Text("新壁纸归档/处理输出：\(report.outputURL.path)")
                     }
+                    if let geometry = model.lastGeometrySummary {
+                        Text(geometry)
+                    }
                     if let warning = report.reloadWarning {
                         Text(warning)
                             .foregroundStyle(.orange)
@@ -423,6 +443,73 @@ struct ContentView: View {
                 Text(reason)
                     .font(.caption)
                     .foregroundStyle(.orange)
+            }
+
+            Divider()
+            Picker("实际观察到的现象", selection: $model.geometryPhenomenonChoice) {
+                ForEach(AppModel.geometryPhenomenonChoices, id: \.self) { choice in
+                    Text(choice).tag(choice)
+                }
+            }
+            .pickerStyle(.menu)
+            HStack(spacing: 8) {
+                Button {
+                    model.diagnoseCurrentTarget()
+                } label: {
+                    Label(
+                        model.isGeneratingGeometryDiagnostic ? "正在诊断…" : "诊断当前目标",
+                        systemImage: "stethoscope"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isProcessing || model.isGeneratingGeometryDiagnostic || model.isReidentifying)
+                Button("导出诊断报告") {
+                    model.exportGeometryDiagnostic()
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.lastGeometryDiagnostic == nil || model.isProcessing)
+                Button("打开诊断文件夹") {
+                    model.openDiagnosticsFolder()
+                }
+                .buttonStyle(.link)
+                Button("重新识别原壁纸") {
+                    model.showReidentifyConfirmation = true
+                }
+                .buttonStyle(.link)
+                .disabled(model.isProcessing || model.isPreparingLayout || model.isGeneratingGeometryDiagnostic || model.isReidentifying)
+            }
+            Text("诊断只读取当前目标、视频几何和显示器信息，不编码、不备份、不替换，也不会重载 WallpaperAgent。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            if let diagnostic = model.lastGeometryDiagnostic {
+                let canvasDescription = diagnostic.chosenCanvas.map {
+                    "\($0.width) × \($0.height)"
+                } ?? "无法可靠判定"
+                let sourceDescription = diagnostic.chosenSource?.displayName ?? "无"
+                DisclosureGroup("最近一次几何诊断") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("目标画布：\(canvasDescription)")
+                        Text("来源：\(sourceDescription)")
+                        if !diagnostic.conflicts.isEmpty {
+                            Text("冲突：\(diagnostic.conflicts.joined(separator: "；"))")
+                                .foregroundStyle(.orange)
+                        }
+                        if !diagnostic.notes.isEmpty {
+                            Text(diagnostic.notes.joined(separator: "\n"))
+                                .foregroundStyle(.secondary)
+                        }
+                        if let url = model.geometryDiagnosticURL {
+                            Text(url.path)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .font(.caption)
+                    .textSelection(.enabled)
+                    .padding(.top, 4)
+                }
             }
         }
     }

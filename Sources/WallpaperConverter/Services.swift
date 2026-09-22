@@ -13,6 +13,12 @@ private final class ExportSessionBox: @unchecked Sendable {
 }
 
 enum EncoderService {
+    struct GeometryEncodingResult: Sendable {
+        let validation: String
+        let intermediate: GeometryVideoSnapshot?
+        let finalOutput: GeometryVideoSnapshot?
+    }
+
     static func prepare() async throws -> URL {
         let encoder = try await validatedBundledEncoder()
         return encoder.url
@@ -54,6 +60,24 @@ enum EncoderService {
         executable: URL,
         cropSelection: WallpaperCropSelection
     ) async throws -> String {
+        try await encodeWithEvidence(
+            input: input,
+            output: output,
+            loopCount: loopCount,
+            bitrateMbps: bitrateMbps,
+            executable: executable,
+            cropSelection: cropSelection
+        ).validation
+    }
+
+    static func encodeWithEvidence(
+        input: URL,
+        output: URL,
+        loopCount: Int,
+        bitrateMbps: Int,
+        executable: URL,
+        cropSelection: WallpaperCropSelection
+    ) async throws -> GeometryEncodingResult {
         try AppPaths.ensureDirectory(output.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: output)
         let croppedInput = output.deletingLastPathComponent().appendingPathComponent(
@@ -79,9 +103,14 @@ enum EncoderService {
               (try? FileManager.default.attributesOfItem(atPath: output.path)[.size] as? NSNumber)?.int64Value ?? 0 > 0 else {
             throw AppError("编码器没有生成有效输出文件。")
         }
-        return try await VideoGeometryService.validateFixedCanvas(
+        let validation = try await VideoGeometryService.validateFixedCanvas(
             at: output,
             expected: AerialCanvas(width: cropSelection.outputWidth, height: cropSelection.outputHeight)
+        )
+        return GeometryEncodingResult(
+            validation: validation,
+            intermediate: await VideoGeometryService.diagnosticSnapshot(at: croppedInput),
+            finalOutput: await VideoGeometryService.diagnosticSnapshot(at: output)
         )
     }
 
@@ -118,23 +147,40 @@ struct VideoGeometrySnapshot: Sendable {
     }
 
     var fixedCanvasEvidence: AerialCanvas? {
+        aerialProfile?.canvas
+    }
+
+    var aerialProfile: AerialGeometryProfile? {
         let width = Int(encodedSize.width)
         let height = Int(encodedSize.height)
-        guard width > 1,
-              height > 1,
-              width.isMultiple(of: 2),
-              height.isMultiple(of: 2),
-              approximatelyEqual(naturalSize.width, CGFloat(width)),
-              approximatelyEqual(naturalSize.height, CGFloat(height)),
-              approximatelyEqual(cleanAperture.width, CGFloat(width)),
-              approximatelyEqual(cleanAperture.height, CGFloat(height)),
-              approximatelyEqual(presentationSize.width, CGFloat(width)),
-              approximatelyEqual(presentationSize.height, CGFloat(height)),
-              hasIdentityTransform,
-              hasSquarePixels else {
-            return nil
-        }
-        return AerialCanvas(width: width, height: height)
+        guard width > 1, height > 1 else { return nil }
+        return AerialGeometryProfile(
+            encodedSize: GeometrySize(width: width, height: height),
+            naturalSize: GeometrySize(width: Double(naturalSize.width), height: Double(naturalSize.height)),
+            cleanAperture: GeometryRect(
+                x: Double(cleanAperture.origin.x),
+                y: Double(cleanAperture.origin.y),
+                width: Double(cleanAperture.width),
+                height: Double(cleanAperture.height)
+            ),
+            presentationSize: GeometrySize(
+                width: Double(presentationSize.width),
+                height: Double(presentationSize.height)
+            ),
+            pixelAspectRatio: pixelAspectRatio.map {
+                PixelAspectRatio(horizontal: $0.horizontal, vertical: $0.vertical)
+            },
+            preferredTransform: GeometryTransform(
+                a: Double(preferredTransform.a),
+                b: Double(preferredTransform.b),
+                c: Double(preferredTransform.c),
+                d: Double(preferredTransform.d),
+                tx: Double(preferredTransform.tx),
+                ty: Double(preferredTransform.ty)
+            ),
+            hasExplicitCleanAperture: hasExplicitCleanAperture,
+            hasExplicitPixelAspectRatio: pixelAspectRatio != nil
+        )
     }
 
     private func approximatelyEqual(_ left: CGFloat, _ right: CGFloat) -> Bool {
@@ -181,6 +227,19 @@ enum VideoGeometryService {
         )
     }
 
+    static func diagnosticSnapshot(at url: URL) async -> GeometryVideoSnapshot? {
+        guard let profile = try? await inspect(url).aerialProfile else { return nil }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes?[.size] as? NSNumber)?.int64Value
+        let duration = (try? await VideoInspector.inspect(url))?.duration
+        return GeometryVideoSnapshot(
+            basename: url.lastPathComponent,
+            fileSize: fileSize,
+            duration: duration,
+            profile: profile
+        )
+    }
+
     static func validateFixedCanvas(
         at url: URL,
         expected: AerialCanvas,
@@ -193,6 +252,8 @@ enum VideoGeometryService {
             && approximatelyEqual(geometry.naturalSize.height, height)
             && geometry.encodedSize.width == Int32(expected.width)
             && geometry.encodedSize.height == Int32(expected.height)
+            && approximatelyEqual(geometry.cleanAperture.origin.x, 0)
+            && approximatelyEqual(geometry.cleanAperture.origin.y, 0)
             && approximatelyEqual(geometry.cleanAperture.width, width)
             && approximatelyEqual(geometry.cleanAperture.height, height)
             && approximatelyEqual(geometry.presentationSize.width, width)
@@ -405,27 +466,37 @@ enum PreviewService {
 }
 
 enum NativeCanvasStore {
-    static func load(from url: URL) throws -> [String: AerialCanvas] {
+    private struct V2File: Codable {
+        let version: Int
+        let records: [String: NativeCanvasRecord]
+    }
+
+    static func load(from url: URL) throws -> [String: NativeCanvasRecord] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
         do {
             let data = try Data(contentsOf: url)
-            return try JSONDecoder().decode([String: AerialCanvas].self, from: data)
+            if let file = try? JSONDecoder().decode(V2File.self, from: data), file.version == 2 {
+                return file.records
+            }
+            let legacy = try JSONDecoder().decode([String: AerialCanvas].self, from: data)
+            return legacy.mapValues(NativeCanvasRecord.legacy(canvas:))
         } catch {
             throw AppError("原生画布记录无法读取，请检查或移走该文件后重试：\(url.path)")
         }
     }
 
     static func save(
-        _ canvas: AerialCanvas,
+        _ record: NativeCanvasRecord,
         uuid: String,
         to url: URL
     ) throws {
         var records = try load(from: url)
-        records[uuid] = canvas
+        records[uuid] = record
         try AppPaths.ensureDirectory(url.deletingLastPathComponent())
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(records).write(to: url, options: [.atomic])
+        let data = try encoder.encode(V2File(version: 2, records: records))
+        try data.write(to: url, options: [.atomic])
     }
 }
 
@@ -486,60 +557,105 @@ enum AerialService {
         uuid: String,
         recordsURL: URL = AppPaths.nativeCanvasRecordsURL
     ) async throws -> AerialCanvas {
+        let resolution = try await outputCanvasResolution(for: target, uuid: uuid, recordsURL: recordsURL)
+        return resolution.canvas
+    }
+
+    static func reidentifyDownloadedOriginal(
+        uuid: String,
+        recordsURL: URL = AppPaths.nativeCanvasRecordsURL
+    ) async throws -> AerialCanvas {
+        let normalizedUUID = normalizeUUID(uuid) ?? uuid.uppercased()
+        let target = try targetURL(uuid: normalizedUUID)
+        guard FileManager.default.isReadableFile(atPath: target.path),
+              let profile = try await geometryProfile(at: target),
+              profile.isCompatibleWithFixedEncoder,
+              let canvas = profile.canvas else {
+            throw AppError("当前目标文件缺失或几何信息不兼容，未更新原生画布记录。")
+        }
+        let originalHash = try sha256(target)
+        if FileManager.default.fileExists(atPath: recordsURL.path) {
+            try AppPaths.ensureDirectory(GeometryDiagnostics.directory)
+            let backup = GeometryDiagnostics.directory.appendingPathComponent(
+                "native-canvases-before-reidentify-\(normalizedUUID)-\(UUID().uuidString).json"
+            )
+            try FileManager.default.copyItem(at: recordsURL, to: backup)
+        }
+        try NativeCanvasStore.save(
+            NativeCanvasRecord(
+                canvas: canvas,
+                source: .reidentified,
+                originalTargetSHA256: originalHash,
+                capturedAt: Date(),
+                geometry: profile
+            ),
+            uuid: normalizedUUID,
+            to: recordsURL
+        )
+        return canvas
+    }
+
+    static func outputCanvasResolution(
+        for target: URL,
+        uuid: String,
+        recordsURL: URL = AppPaths.nativeCanvasRecordsURL,
+        persistResolution: Bool = true,
+        migrateProcessedHistory: Bool = true
+    ) async throws -> NativeCanvasResolution {
         let normalizedUUID = normalizeUUID(uuid) ?? uuid.uppercased()
         let records = try NativeCanvasStore.load(from: recordsURL)
-        let persistedCanvas = records[normalizedUUID]
+        let persistedRecord = records[normalizedUUID]
         let manifestCanvas = explicitManifestCanvas(uuid: normalizedUUID)
+        let targetProfile = try? await geometryProfile(at: target)
+        // The migration is synchronous during processing. This prevents a
+        // just-created Processed file from racing the fresh-target decision.
+        if migrateProcessedHistory {
+            migrateProcessedOutputs()
+        }
         let matchingArchives = archiveEntries().filter { entry in
             let filenameUUID = normalizeUUID(entry.url.deletingPathExtension().lastPathComponent)
             return entry.uuid == normalizedUUID || filenameUUID == normalizedUUID
         }
         let originalArchives = matchingArchives.filter { $0.kind == .original }
         let backupEntries = backups(for: normalizedUUID)
-        let hasAnyHistoricalRecords = !matchingArchives.isEmpty || !backupEntries.isEmpty
+        let processedEntries = processedOutputs(for: normalizedUUID)
+        let hasAnyHistoricalRecords = persistedRecord != nil || !matchingArchives.isEmpty || !backupEntries.isEmpty || !processedEntries.isEmpty
 
-        var resolution = NativeCanvasResolver.resolve(
-            persistedCanvas: persistedCanvas,
-            manifestCanvas: manifestCanvas,
-            targetCanvas: nil,
-            hasAnyHistoricalRecords: hasAnyHistoricalRecords,
-            earliestOriginalCanvas: nil,
-            earliestBackupCanvas: nil
-        )
-        if resolution == nil, !hasAnyHistoricalRecords {
+        var resolution: NativeCanvasResolution?
+        if !hasAnyHistoricalRecords {
             resolution = NativeCanvasResolver.resolve(
-                persistedCanvas: nil,
-                manifestCanvas: nil,
-                targetCanvas: try? await fixedCanvas(at: target),
+                persistedRecord: persistedRecord,
+                manifestCanvas: manifestCanvas,
+                targetProfile: targetProfile,
                 hasAnyHistoricalRecords: false,
-                earliestOriginalCanvas: nil,
-                earliestBackupCanvas: nil
+                earliestOriginalProfile: nil,
+                earliestBackupProfile: nil
             )
-        }
-        if resolution == nil, hasAnyHistoricalRecords {
+        } else {
             let earliestOriginal = originalArchives.min(by: isEarlierOriginalArchive)
             let earliestBackup = backupEntries.min {
                 backupChronology($0) < backupChronology($1)
             }
-            let earliestOriginalCanvas: AerialCanvas?
+            let earliestOriginalProfile: AerialGeometryProfile?
             if let earliestOriginal {
-                earliestOriginalCanvas = try? await fixedCanvas(at: earliestOriginal.url)
+                earliestOriginalProfile = try? await geometryProfile(at: earliestOriginal.url)
             } else {
-                earliestOriginalCanvas = nil
+                earliestOriginalProfile = nil
             }
-            let earliestBackupCanvas: AerialCanvas?
+            let earliestBackupProfile: AerialGeometryProfile?
             if let earliestBackup {
-                earliestBackupCanvas = try? await fixedCanvas(at: earliestBackup.url)
+                earliestBackupProfile = try? await geometryProfile(at: earliestBackup.url)
             } else {
-                earliestBackupCanvas = nil
+                earliestBackupProfile = nil
             }
             resolution = NativeCanvasResolver.resolve(
-                persistedCanvas: nil,
-                manifestCanvas: nil,
-                targetCanvas: nil,
+                persistedRecord: persistedRecord,
+                manifestCanvas: manifestCanvas,
+                targetProfile: targetProfile,
                 hasAnyHistoricalRecords: true,
-                earliestOriginalCanvas: earliestOriginalCanvas,
-                earliestBackupCanvas: earliestBackupCanvas
+                earliestOriginalProfile: earliestOriginalProfile,
+                earliestBackupProfile: earliestBackupProfile,
+                earliestOriginalSHA256: earliestOriginal.flatMap { try? sha256($0.url) }
             )
         }
         guard let resolution else {
@@ -548,14 +664,192 @@ enum AerialService {
                 "或确认同 UUID 最早的原壁纸归档与最早备份完整且画布一致后重试。"
             )
         }
-        if resolution.shouldPersist {
-            try NativeCanvasStore.save(resolution.canvas, uuid: normalizedUUID, to: recordsURL)
+        if persistResolution && resolution.shouldPersist {
+            let originalHash: String?
+            if resolution.source == .currentTarget {
+                originalHash = try sha256(target)
+            } else {
+                originalHash = resolution.originalTargetSHA256
+            }
+            guard let originalHash else {
+                throw AppError("无法校验系统原壁纸归档，未保存画布记录。")
+            }
+            let record = NativeCanvasRecord(
+                canvas: resolution.canvas,
+                source: resolution.source,
+                originalTargetSHA256: originalHash,
+                capturedAt: Date(),
+                geometry: resolution.profile
+            )
+            try NativeCanvasStore.save(record, uuid: normalizedUUID, to: recordsURL)
         }
-        return resolution.canvas
+        return resolution
     }
 
-    private static func fixedCanvas(at url: URL) async throws -> AerialCanvas? {
-        try await VideoGeometryService.inspect(url).fixedCanvasEvidence
+    static func diagnoseCurrentTarget(
+        uuid: String,
+        inputURL: URL? = nil,
+        recordsURL: URL = AppPaths.nativeCanvasRecordsURL
+    ) async throws -> GeometryDiagnosticReport {
+        let normalizedUUID = normalizeUUID(uuid) ?? uuid.uppercased()
+        let target = try targetURL(uuid: normalizedUUID)
+        guard FileManager.default.isReadableFile(atPath: target.path) else {
+            throw AppError("目标动态壁纸不存在，请先在系统设置→壁纸中下载动态壁纸。")
+        }
+
+        let screens = GeometryDiagnostics.currentScreens()
+        let targetVideo = await diagnosticVideo(at: target)
+        let inputVideo: GeometryVideoSnapshot?
+        if let inputURL {
+            inputVideo = await awaitDiagnosticVideo(at: inputURL)
+        } else {
+            inputVideo = nil
+        }
+        let targetHash = try? sha256(target)
+        let records = try NativeCanvasStore.load(from: recordsURL)
+        let persistedRecord = records[normalizedUUID]
+        let manifestCanvas = explicitManifestCanvas(uuid: normalizedUUID)
+        let matchingArchives = archiveEntries().filter { entry in
+            let filenameUUID = normalizeUUID(entry.url.deletingPathExtension().lastPathComponent)
+            return entry.uuid == normalizedUUID || filenameUUID == normalizedUUID
+        }
+        let referenceArchive = matchingArchives.filter { $0.kind == .original }.min(by: isEarlierOriginalArchive)
+        let referenceOriginal: GeometryVideoSnapshot? = if let referenceArchive {
+            await diagnosticVideo(at: referenceArchive.url)
+        } else {
+            nil
+        }
+        let backupEntries = backups(for: normalizedUUID)
+        let processed = processedOutputs(for: normalizedUUID)
+        var historyEvidence = matchingArchives.map {
+            "\($0.kind.rawValue):\($0.url.lastPathComponent)"
+        }
+        historyEvidence.append(contentsOf: backupEntries.map { "backup:\($0.url.lastPathComponent)" })
+        historyEvidence.append(contentsOf: processed.map { "processed:\($0.lastPathComponent)" })
+
+        var chosen: NativeCanvasResolution?
+        var resolutionError: String?
+        do {
+            chosen = try await outputCanvasResolution(
+                for: target,
+                uuid: normalizedUUID,
+                recordsURL: recordsURL,
+                persistResolution: false,
+                migrateProcessedHistory: false
+            )
+        } catch {
+            resolutionError = error.localizedDescription
+        }
+
+        var crop: GeometryCropDiagnostic?
+        var notes: [String] = []
+        if let warning = GeometryDiagnostics.displayAspectWarning(from: screens) {
+            notes.append(warning)
+        }
+        if let inputURL,
+           let inputInfo = try? await VideoInspector.inspect(inputURL),
+           let chosenCanvas = chosen?.canvas,
+           let screenAspect = GeometryDiagnostics.mainAspect(from: screens),
+           let selection = WallpaperGeometry.cropSelection(
+               sourceWidth: Double(inputInfo.width),
+               sourceHeight: Double(inputInfo.height),
+               screenAspect: screenAspect,
+               outputCanvas: chosenCanvas
+           ) {
+            crop = GeometryCropDiagnostic(selection: selection, screenAspect: screenAspect)
+        }
+        if let resolutionError {
+            notes.append("resolver: \(resolutionError)")
+        }
+        let referenceProfile = GeometryDiagnostics.originalReferenceProfile(
+            chosenSource: chosen?.source,
+            targetHash: targetHash,
+            targetProfile: targetVideo?.profile,
+            persistedRecord: persistedRecord,
+            archiveProfile: referenceOriginal?.profile
+        )
+        let diffs = geometryDiffs(target: referenceProfile, chosen: chosen?.profile)
+        return GeometryDiagnosticReport(
+            schemaVersion: GeometryDiagnosticReport.schemaVersion,
+            appVersion: (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "开发版",
+            createdAt: Date(),
+            macOS: ProcessInfo.processInfo.operatingSystemVersionString,
+            architecture: architectureName,
+            screens: screens,
+            targetUUID: normalizedUUID,
+            input: inputVideo,
+            targetBefore: targetVideo,
+            targetBeforeSHA256: targetHash,
+            referenceOriginal: referenceOriginal,
+            manifestCanvas: manifestCanvas,
+            persistedRecord: persistedRecord,
+            historyEvidence: historyEvidence,
+            chosenCanvas: chosen?.canvas,
+            chosenSource: chosen?.source,
+            chosenEvidence: chosen?.evidence,
+            crop: crop,
+            intermediate: nil,
+            finalOutput: nil,
+            finalOutputSHA256: nil,
+            installedTarget: nil,
+            installedTargetSHA256: nil,
+            outputMatchesInstalledTarget: nil,
+            diffs: diffs,
+            conflicts: (chosen?.conflicts ?? []) + (resolutionError.map { [$0] } ?? []),
+            phenomenon: nil,
+            notes: notes
+        )
+    }
+
+    private static func geometryProfile(at url: URL) async throws -> AerialGeometryProfile? {
+        try await VideoGeometryService.inspect(url).aerialProfile
+    }
+
+    private static func diagnosticVideo(at url: URL) async -> GeometryVideoSnapshot? {
+        await awaitDiagnosticVideo(at: url)
+    }
+
+    private static func awaitDiagnosticVideo(at url: URL) async -> GeometryVideoSnapshot? {
+        guard let profile = try? await geometryProfile(at: url) else { return nil }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attributes?[.size] as? NSNumber)?.int64Value
+        let duration = (try? await VideoInspector.inspect(url))?.duration
+        return GeometryVideoSnapshot(
+            basename: url.lastPathComponent,
+            fileSize: size,
+            duration: duration,
+            profile: profile
+        )
+    }
+
+    private static func geometryDiffs(
+        target: AerialGeometryProfile?,
+        chosen: AerialGeometryProfile?
+    ) -> [String] {
+        GeometryDiagnostics.profileDifferences("chosen-vs-original", left: chosen, right: target)
+    }
+
+    private static var architectureName: String {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "x86_64"
+        #else
+        return "unknown"
+        #endif
+    }
+
+    private static func processedOutputs(for uuid: String) -> [URL] {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: AppPaths.processedDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return urls.filter {
+            $0.pathExtension.lowercased() == "mov"
+                && uuidFromProcessedFilename($0) == uuid
+                && (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }
     }
 
     private static func isEarlierOriginalArchive(
