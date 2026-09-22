@@ -41,6 +41,8 @@ final class AppModel: ObservableObject {
     @Published var isPreparingLayout = false
     @Published var archiveNameText = ""
     @Published var pendingCropSelection: WallpaperCropSelection?
+    @Published var pendingCropOrientation: GeometryOrientationAssessment?
+    @Published var pendingCropWarning: String?
     @Published var showCropSheet = false
     @Published var showEnvironmentActionConfirmation = false
     @Published var showReidentifyConfirmation = false
@@ -246,6 +248,8 @@ final class AppModel: ObservableObject {
         inputPath = url.path
         inputInfo = nil
         pendingCropSelection = nil
+        pendingCropOrientation = nil
+        pendingCropWarning = nil
         showCropSheet = false
         alertMessage = nil
         isInspectingVideo = true
@@ -407,6 +411,26 @@ final class AppModel: ObservableObject {
                 let canvas = resolution.canvas
                 lastGeometrySummary = "目标画布 \(canvas.width) × \(canvas.height)；来源 \(resolution.source.displayName)"
                 lastGeometrySource = resolution.source.rawValue
+
+                let diagnostic = try? await AerialService.diagnoseCurrentTarget(
+                    uuid: values.uuid,
+                    inputURL: values.input.url
+                )
+                let orientation = diagnostic?.orientationAssessment ?? GeometryDiagnostics.orientationAssessment(
+                    sourceSize: GeometrySize(width: values.input.width, height: values.input.height),
+                    screens: GeometryDiagnostics.currentScreens(),
+                    targetProfile: resolution.profile,
+                    referenceOriginalProfile: resolution.profile,
+                    chosenCanvas: canvas,
+                    chosenSource: resolution.source,
+                    manifestCanvas: nil
+                )
+                pendingCropOrientation = orientation
+                pendingCropWarning = orientation.warningMessage
+                if let blockingReason = orientation.blockingReason {
+                    throw AppError(blockingReason)
+                }
+
                 guard let layout = wallpaperLayout(for: values.input, outputCanvas: canvas) else {
                     throw AppError("无法读取主显示器尺寸，不能安全生成壁纸画布。")
                 }
@@ -417,7 +441,9 @@ final class AppModel: ObservableObject {
                     "conflicts=\(resolution.conflicts.joined(separator: ";")) " +
                     "visibleCrop=\(Int(layout.cropWidth))x\(Int(layout.cropHeight))"
                 )
-                if requiresCrop(for: values.input) {
+                if requiresCrop(for: values.input)
+                    || layoutNeedsCropReview(layout, input: values.input)
+                    || orientation.requiresReview {
                     showCropSheet = true
                 } else {
                     showProcessConfirmation = true
@@ -445,6 +471,8 @@ final class AppModel: ObservableObject {
 
     func cancelCropSelection() {
         pendingCropSelection = nil
+        pendingCropOrientation = nil
+        pendingCropWarning = nil
         showCropSheet = false
     }
 
@@ -454,6 +482,30 @@ final class AppModel: ObservableObject {
         selection.originY = originY
         selection.clamp()
         pendingCropSelection = selection
+    }
+
+    func updatePendingCropZoom(zoomFactor: Double) {
+        guard let selection = pendingCropSelection,
+              let zoomed = WallpaperGeometry.zoomedSelection(
+                  from: selection,
+                  zoomFactor: min(3, max(1, zoomFactor))
+              ) else {
+            return
+        }
+        var updated = zoomed
+        updated.clamp()
+        pendingCropSelection = updated
+    }
+
+    func resetPendingCrop() {
+        guard let selection = pendingCropSelection,
+              var maximum = WallpaperGeometry.maximumSelection(for: selection) else {
+            return
+        }
+        maximum.originX = (maximum.sourceWidth - maximum.cropWidth) / 2
+        maximum.originY = (maximum.sourceHeight - maximum.cropHeight) / 2
+        maximum.clamp()
+        pendingCropSelection = maximum
     }
 
     func startProcessing() {
@@ -981,6 +1033,18 @@ final class AppModel: ObservableObject {
             screenAspect: display.aspect,
             outputCanvas: outputCanvas
         )
+    }
+
+    private func layoutNeedsCropReview(
+        _ selection: WallpaperCropSelection,
+        input: InputVideoInfo
+    ) -> Bool {
+        let sourceWidth = Double(input.width)
+        let sourceHeight = Double(input.height)
+        guard sourceWidth > 1, sourceHeight > 1 else { return false }
+        let widthReduction = 1 - selection.cropWidth / sourceWidth
+        let heightReduction = 1 - selection.cropHeight / sourceHeight
+        return widthReduction > 0.02 || heightReduction > 0.02
     }
 
     private func displayPixelSize() -> (width: Int, height: Int, aspect: Double)? {

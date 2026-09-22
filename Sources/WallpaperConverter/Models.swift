@@ -503,6 +503,9 @@ enum WallpaperGeometry {
         guard sourceWidth > 1,
               sourceHeight > 1,
               screenAspect > 0,
+              sourceWidth.isFinite,
+              sourceHeight.isFinite,
+              screenAspect.isFinite,
               outputCanvas.width > 1,
               outputCanvas.height > 1 else {
             return nil
@@ -538,6 +541,79 @@ enum WallpaperGeometry {
         guard achievableOriginRange(for: selection) != nil else { return nil }
         selection.clamp()
         return selection
+    }
+
+    static func maximumSelection(
+        for selection: WallpaperCropSelection
+    ) -> WallpaperCropSelection? {
+        guard isFinite(selection),
+              selection.sourceWidth > 1,
+              selection.sourceHeight > 1,
+              selection.cropWidth > 1,
+              selection.cropHeight > 1,
+              selection.visibleAspect > 0,
+              selection.outputWidth > 1,
+              selection.outputHeight > 1 else {
+            return nil
+        }
+        return cropSelection(
+            sourceWidth: selection.sourceWidth,
+            sourceHeight: selection.sourceHeight,
+            screenAspect: selection.visibleAspect,
+            outputCanvas: AerialCanvas(width: selection.outputWidth, height: selection.outputHeight)
+        )
+    }
+
+    static func zoomedSelection(
+        from selection: WallpaperCropSelection,
+        zoomFactor: Double
+    ) -> WallpaperCropSelection? {
+        guard zoomFactor.isFinite,
+              zoomFactor >= 1,
+              zoomFactor <= 3,
+              let maximal = maximumSelection(for: selection) else {
+            return nil
+        }
+
+        let cropWidth = maximal.cropWidth / zoomFactor
+        let cropHeight = maximal.cropHeight / zoomFactor
+        let centerX = selection.originX + selection.cropWidth / 2
+        let centerY = selection.originY + selection.cropHeight / 2
+        guard cropWidth > 1,
+              cropHeight > 1,
+              cropWidth.isFinite,
+              cropHeight.isFinite,
+              centerX.isFinite,
+              centerY.isFinite else {
+            return nil
+        }
+
+        var zoomed = WallpaperCropSelection(
+            sourceWidth: maximal.sourceWidth,
+            sourceHeight: maximal.sourceHeight,
+            cropWidth: cropWidth,
+            cropHeight: cropHeight,
+            outputWidth: maximal.outputWidth,
+            outputHeight: maximal.outputHeight,
+            visibleAspect: maximal.visibleAspect,
+            originX: centerX - cropWidth / 2,
+            originY: centerY - cropHeight / 2
+        )
+        guard achievableOriginRange(for: zoomed) != nil else { return nil }
+        zoomed.clamp()
+        return zoomed
+    }
+
+    private static func isFinite(_ selection: WallpaperCropSelection) -> Bool {
+        selection.sourceWidth.isFinite
+            && selection.sourceHeight.isFinite
+            && selection.cropWidth.isFinite
+            && selection.cropHeight.isFinite
+            && selection.outputWidth > 1
+            && selection.outputHeight > 1
+            && selection.visibleAspect.isFinite
+            && selection.originX.isFinite
+            && selection.originY.isFinite
     }
 
     static func achievableOriginRange(
