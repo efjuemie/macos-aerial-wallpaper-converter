@@ -880,8 +880,9 @@ final class AppModel: ObservableObject {
                     throw error
                 }
                 geometryReport?.installedTarget = await VideoGeometryService.diagnosticSnapshot(at: target)
-                geometryReport?.installedTargetSHA256 = try? AerialService.sha256(target)
-                geometryReport?.outputMatchesInstalledTarget = geometryReport?.installedTargetSHA256 == sourceHash
+                let installedHash = try? AerialService.sha256(target)
+                geometryReport?.installedTargetSHA256 = installedHash
+                geometryReport?.outputMatchesInstalledTarget = installedHash == sourceHash
                 if var report = geometryReport {
                     let originalProfile = GeometryDiagnostics.originalReferenceProfile(
                         chosenSource: report.chosenSource,
