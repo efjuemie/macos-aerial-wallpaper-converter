@@ -132,18 +132,11 @@ struct ContentView: View {
                 RoundedRectangle(cornerRadius: 12)
                     .strokeBorder(Color.accentColor.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [6]))
             }
-            .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
-                guard let provider = providers.first else { return false }
-                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    var url: URL?
-                    if let itemURL = item as? URL {
-                        url = itemURL
-                    } else if let data = item as? Data {
-                        url = URL(dataRepresentation: data, relativeTo: nil)
-                    }
-                    guard let url else { return }
-                    DispatchQueue.main.async { model.loadVideo(at: url) }
-                }
+            .onDrop(
+                of: [UTType.fileURL.identifier, UTType.url.identifier, UTType.text.identifier],
+                isTargeted: nil
+            ) { providers in
+                loadDroppedVideo(from: providers)
                 return true
             }
 
@@ -151,6 +144,13 @@ struct ContentView: View {
                 Label("正在读取视频信息…", systemImage: "hourglass")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if let inputLoadError = model.inputLoadError {
+                Label("读取失败：\(inputLoadError)", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
             }
 
             if let info = model.inputInfo {
@@ -167,6 +167,50 @@ struct ContentView: View {
                     .lineLimit(1)
             }
         }
+    }
+
+    private func loadDroppedVideo(from providers: [NSItemProvider]) {
+        let supportedTypes = [
+            UTType.fileURL.identifier,
+            UTType.url.identifier,
+            UTType.text.identifier
+        ]
+
+        func loadProvider(at index: Int, lastError: String? = nil) {
+            guard index < providers.count else {
+                let detail = lastError.map { "：\($0)" } ?? ""
+                DispatchQueue.main.async {
+                    model.recordInputLoadFailure("无法识别拖入的本地视频文件\(detail)")
+                }
+                return
+            }
+
+            let provider = providers[index]
+            guard let typeIdentifier = supportedTypes.first(where: {
+                provider.hasItemConformingToTypeIdentifier($0)
+            }) else {
+                loadProvider(at: index + 1, lastError: lastError)
+                return
+            }
+
+            provider.loadItem(forTypeIdentifier: typeIdentifier, options: nil) { item, error in
+                if let item {
+                    switch DroppedVideoURLResolver.resolve(item) {
+                    case let .success(url):
+                        DispatchQueue.main.async {
+                            model.loadVideo(at: url)
+                        }
+                        return
+                    case let .failure(parseError):
+                        loadProvider(at: index + 1, lastError: parseError.localizedDescription)
+                        return
+                    }
+                }
+                loadProvider(at: index + 1, lastError: error?.localizedDescription)
+            }
+        }
+
+        loadProvider(at: 0)
     }
 
     private var targetSection: some View {
@@ -187,7 +231,6 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                 } else {
                     Picker("已安装的动态壁纸", selection: $model.selectedUUID) {
-                        Text("手动输入 UUID").tag("")
                         ForEach(model.targets) { target in
                             Text(target.uuid).tag(target.uuid)
                         }
@@ -223,11 +266,16 @@ struct ContentView: View {
                 })
                 .textFieldStyle(.roundedBorder)
                 .disabled(model.isReidentifying || model.isPreparingLayout)
-                Image(systemName: model.selectedTargetExists ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(model.selectedTargetExists ? .green : .orange)
-                Text(model.selectedTargetExists ? "目标文件存在" : "目标文件不存在")
+                Image(systemName: model.selectedTargetAvailability.isAvailable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(model.selectedTargetAvailability.isAvailable ? .green : .orange)
+                Text(
+                    model.selectedTargetAvailability.isAvailable
+                        ? "目标文件存在"
+                        : model.selectedTargetAvailability.message
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
             Text("默认目标：\(AppModel.defaultUUID)。如果不存在，请先在系统设置→壁纸中下载并应用对应动态壁纸。")
                 .font(.caption)
@@ -379,7 +427,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(model.phase.title)
                         .fontWeight(.semibold)
-                    Text(model.phase.detail)
+                    Text(model.processingDetail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -439,7 +487,7 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .disabled(!model.canStart)
-            if !model.isProcessing, let reason = model.environmentBlockReason {
+            if let reason = model.processingBlockMessage {
                 Text(reason)
                     .font(.caption)
                     .foregroundStyle(.orange)

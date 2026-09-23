@@ -36,6 +36,7 @@ final class AppModel: ObservableObject {
     @Published var showProcessConfirmation = false
     @Published var showRestoreConfirmation = false
     @Published var alertMessage: String?
+    @Published var inputLoadError: String?
     @Published var isProcessing = false
     @Published var isInspectingVideo = false
     @Published var isPreparingLayout = false
@@ -63,14 +64,26 @@ final class AppModel: ObservableObject {
     ]
 
     private let logger = AppLogger()
+    private let videoInspector: @Sendable (URL) async throws -> InputVideoInfo
     private var previewTask: Task<Void, Never>?
     private var environmentRefreshTask: Task<Void, Never>?
+    private var videoInspectionTask: Task<Void, Never>?
+    private var videoLoadState = VideoLoadStateMachine()
     private var pendingEnvironmentAction: EnvironmentAction?
 
-    init() {
-        refresh()
-        if let path = CommandLine.arguments.dropFirst().first, !path.isEmpty {
-            loadVideo(at: URL(fileURLWithPath: path))
+    init(
+        autoRefresh: Bool = true,
+        videoInspector: @escaping @Sendable (URL) async throws -> InputVideoInfo = { url in
+            try await VideoInspector.inspect(url)
+        }
+    ) {
+        self.videoInspector = videoInspector
+        if autoRefresh {
+            refresh()
+        }
+        if autoRefresh, let path = CommandLine.arguments.dropFirst().first, !path.isEmpty {
+            inputPath = path
+            loadVideoFromPathField()
         }
     }
 
@@ -86,38 +99,85 @@ final class AppModel: ObservableObject {
         environmentChecks.isEmpty || environmentChecks.contains { $0.status == .checking }
     }
 
-    var environmentBlockReason: String? {
-        let failures = environmentChecks.filter(\.blocksProcessing)
-        guard !failures.isEmpty else {
-            return isEnvironmentChecking ? "正在检查运行环境…" : nil
+    var selectedTargetAvailability: TargetAvailability {
+        guard let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) else {
+            return .invalidUUID
         }
-        return "请先处理：" + failures.map(\.name).joined(separator: "、")
+        let targetURL = AppPaths.aerialDirectory.appendingPathComponent("\(uuid).mov")
+        return TargetAvailability.evaluate(targetURL)
+    }
+
+    var processingReadiness: ProcessingReadiness {
+        ProcessingReadiness.evaluate(
+            ProcessingReadinessInput(
+                inputLoaded: inputInfo != nil,
+                isInspectingVideo: isInspectingVideo,
+                uuidValid: TargetSelectionPolicy.normalizeUUID(uuidText) != nil,
+                targetAvailability: selectedTargetAvailability,
+                environmentChecking: isEnvironmentChecking,
+                environmentFailures: environmentChecks.filter(\.blocksProcessing).map(\.name),
+                isProcessing: isProcessing,
+                isPreparingLayout: isPreparingLayout,
+                isReidentifying: isReidentifying
+            )
+        )
+    }
+
+    var processingBlockReason: ProcessingBlockReason? {
+        processingReadiness.blockReason
+    }
+
+    var processingBlockMessage: String? {
+        processingBlockReason?.message
+    }
+
+    var processingDetail: String {
+        if case .idle = phase {
+            return processingBlockMessage ?? "已就绪，可以处理。"
+        }
+        return phase.detail
     }
 
     var canStart: Bool {
-        inputInfo != nil
-            && selectedTargetExists
-            && !hasBlockingEnvironmentFailure
-            && !isEnvironmentChecking
-            && !isProcessing
-            && !isInspectingVideo
-            && !isPreparingLayout
-            && !isReidentifying
+        processingReadiness.canStart
     }
 
     var selectedTargetExists: Bool {
-        guard let uuid = AerialService.normalizeUUID(uuidText) else { return false }
-        return FileManager.default.fileExists(atPath: AppPaths.aerialDirectory.appendingPathComponent("\(uuid).mov").path)
+        selectedTargetAvailability.isAvailable
+    }
+
+    private func logReadiness(_ event: String) {
+        let input = processingReadiness
+        let reason = input.blockReason?.message ?? "ready"
+        let blockingEnvironment = environmentChecks
+            .filter { $0.blocksProcessing }
+            .map { $0.name }
+            .joined(separator: ",")
+        logger.write(
+            "[Readiness] event=\(event) canStart=\(input.canStart) reason=\(reason) " +
+            "inputLoaded=\(inputInfo != nil) inspecting=\(isInspectingVideo) " +
+            "uuid=\(uuidText) targetAvailability=\(selectedTargetAvailability) " +
+            "environmentChecking=\(isEnvironmentChecking) " +
+            "blockingEnvironment=\(blockingEnvironment) " +
+            "processing=\(isProcessing) preparingLayout=\(isPreparingLayout) reidentifying=\(isReidentifying)"
+        )
     }
 
     func refresh() {
         environmentRefreshTask?.cancel()
-        environmentChecks = EnvironmentCheckBuilder.checking()
+        let hasCheckingStatus = environmentChecks.contains { $0.status == .checking }
+        if EnvironmentRefreshPolicy.shouldResetToChecking(
+            checkCount: environmentChecks.count,
+            hasCheckingStatus: hasCheckingStatus
+        ) {
+            environmentChecks = EnvironmentCheckBuilder.checking()
+        }
         environmentRefreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let checks = await EnvironmentChecker.check()
             guard !Task.isCancelled else { return }
             self.environmentChecks = checks
+            self.logReadiness("environment check completed")
         }
         refreshTargets()
         if ArchiveRefreshPolicy.shouldRefreshArchives(isProcessing: isProcessing) {
@@ -126,8 +186,24 @@ final class AppModel: ObservableObject {
     }
 
     func refreshTargets() {
-        targets = AerialService.targets()
-        backups = AerialService.backups(for: AerialService.normalizeUUID(uuidText) ?? Self.defaultUUID)
+        let discoveredTargets = AerialService.targets()
+        targets = discoveredTargets.filter {
+            TargetAvailability.evaluate($0.url).isAvailable
+        }
+        let availableUUIDs = targets.map(\.uuid)
+        if let selected = TargetSelectionPolicy.select(
+            uuidText: uuidText,
+            selectedUUID: selectedUUID,
+            availableUUIDs: availableUUIDs
+        ) {
+            uuidText = selected
+            selectedUUID = selected
+            backups = AerialService.backups(for: selected)
+        } else {
+            selectedUUID = ""
+            backups = []
+        }
+        logReadiness("refresh targets")
     }
 
     func refreshArchives() {
@@ -238,39 +314,107 @@ final class AppModel: ObservableObject {
     }
 
     func loadVideoFromPathField() {
-        let path = inputPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else { return }
-        loadVideo(at: URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+        switch VideoInputParser.parse(inputPath) {
+        case let .success(url):
+            loadVideo(at: url)
+        case let .failure(error):
+            recordInputLoadFailure(error.localizedDescription)
+        }
     }
 
     func loadVideo(at url: URL) {
         guard !isProcessing else { return }
+        switch VideoInputParser.parse(url) {
+        case let .failure(error):
+            recordInputLoadFailure(error.localizedDescription)
+        case let .success(parsedURL):
+            beginVideoInspection(parsedURL)
+        }
+    }
+
+    private func beginVideoInspection(_ url: URL) {
+        videoInspectionTask?.cancel()
+        videoInspectionTask = nil
+        let generation = videoLoadState.begin()
         inputPath = url.path
         inputInfo = nil
+        inputLoadError = nil
         pendingCropSelection = nil
         pendingCropOrientation = nil
         pendingCropWarning = nil
         showCropSheet = false
         alertMessage = nil
         isInspectingVideo = true
+        logReadiness("loadVideo start file=\(url.lastPathComponent)")
 
-        Task { @MainActor in
+        videoInspectionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                _ = self.finishVideoInspection(generation)
+            }
             do {
-                let info = try await VideoInspector.inspect(url)
-                guard !Task.isCancelled else { return }
-                inputInfo = info
-                isInspectingVideo = false
+                let info = try await self.videoInspector(url)
+                try Task.checkCancellation()
+                guard self.videoLoadState.isCurrent(generation) else { return }
+                self.inputInfo = info
+                self.inputLoadError = nil
                 if let detectedUUID = AerialService.uuidFromFilename(url) {
-                    uuidText = detectedUUID
-                    selectedUUID = detectedUUID
-                    backups = AerialService.backups(for: detectedUUID)
+                    if self.targets.contains(where: { $0.uuid == detectedUUID }) {
+                        self.uuidText = detectedUUID
+                        self.selectedUUID = detectedUUID
+                        self.backups = AerialService.backups(for: detectedUUID)
+                    }
                 }
-                logger.write("Loaded input=\(url.path) duration=\(info.duration) size=\(info.width)x\(info.height)")
+                guard self.finishVideoInspection(generation) else { return }
+                self.logger.write("Loaded input=\(url.lastPathComponent) duration=\(info.duration) size=\(info.width)x\(info.height)")
+                self.logReadiness("inspect success")
+            } catch is CancellationError {
+                guard self.videoLoadState.isCurrent(generation) else { return }
+                _ = self.finishVideoInspection(generation)
+                self.logger.write("Input inspect cancelled file=\(url.lastPathComponent)")
+                self.logReadiness("inspect cancelled")
             } catch {
-                isInspectingVideo = false
-                alertMessage = error.localizedDescription
+                guard self.videoLoadState.isCurrent(generation) else { return }
+                self.inputInfo = nil
+                self.inputLoadError = error.localizedDescription
+                _ = self.finishVideoInspection(generation)
+                self.logger.write("Input inspect failed file=\(url.lastPathComponent): \(error.localizedDescription)")
+                self.logReadiness("inspect failed")
             }
         }
+    }
+
+    private func finishVideoInspection(_ generation: UUID) -> Bool {
+        guard videoLoadState.finish(generation) else { return false }
+        isInspectingVideo = false
+        videoInspectionTask = nil
+        return true
+    }
+
+    func recordInputLoadFailure(_ message: String) {
+        videoInspectionTask?.cancel()
+        videoInspectionTask = nil
+        _ = videoLoadState.cancelCurrent()
+        inputInfo = nil
+        inputLoadError = message
+        alertMessage = nil
+        isInspectingVideo = false
+        pendingCropSelection = nil
+        pendingCropOrientation = nil
+        pendingCropWarning = nil
+        showCropSheet = false
+        logger.write("Input load failed (details shown in UI)")
+        logReadiness("input failure")
+    }
+
+    func cancelVideoInspection() {
+        guard videoLoadState.isBusy else { return }
+        videoInspectionTask?.cancel()
+        videoInspectionTask = nil
+        _ = videoLoadState.cancelCurrent()
+        isInspectingVideo = false
+        logger.write("Input inspect cancelled by user")
+        logReadiness("inspect cancelled")
     }
 
     func openDynamicWallpaperFolder() {
@@ -283,7 +427,7 @@ final class AppModel: ObservableObject {
     }
 
     func diagnoseCurrentTarget() {
-        guard let uuid = AerialService.normalizeUUID(uuidText) else {
+        guard let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) else {
             alertMessage = "请输入有效的 Aerial UUID。"
             return
         }
@@ -301,7 +445,7 @@ final class AppModel: ObservableObject {
                     uuid: uuid,
                     inputURL: inputURL
                 )
-                guard AerialService.normalizeUUID(self.uuidText) == uuid else { return }
+                guard TargetSelectionPolicy.normalizeUUID(self.uuidText) == uuid else { return }
                 report.phenomenon = self.geometryPhenomenonChoice
                 self.lastGeometryDiagnostic = report
                 let url = try GeometryDiagnostics.export(report)
@@ -341,7 +485,7 @@ final class AppModel: ObservableObject {
 
     func reidentifyDownloadedOriginal() {
         guard !isProcessing, !isPreparingLayout, !isGeneratingGeometryDiagnostic, !isReidentifying else { return }
-        guard let uuid = AerialService.normalizeUUID(uuidText) else {
+        guard let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) else {
             alertMessage = "请输入有效的动态壁纸 UUID。"
             return
         }
@@ -351,7 +495,7 @@ final class AppModel: ObservableObject {
             defer { self.isReidentifying = false }
             do {
                 let canvas = try await AerialService.reidentifyDownloadedOriginal(uuid: uuid)
-                guard AerialService.normalizeUUID(self.uuidText) == uuid else { return }
+                guard TargetSelectionPolicy.normalizeUUID(self.uuidText) == uuid else { return }
                 self.pendingCropSelection = nil
                 self.showCropSheet = false
                 self.showProcessConfirmation = false
@@ -367,19 +511,20 @@ final class AppModel: ObservableObject {
     }
 
     func selectTarget(_ uuid: String) {
-        guard !uuid.isEmpty else { return }
-        if selectedUUID != uuid {
+        guard let normalizedUUID = TargetSelectionPolicy.normalizeUUID(uuid) else { return }
+        if selectedUUID != normalizedUUID {
             lastGeometryDiagnostic = nil
             geometryDiagnosticURL = nil
             lastGeometrySummary = nil
         }
-        uuidText = uuid
-        selectedUUID = uuid
-        backups = AerialService.backups(for: uuid)
+        uuidText = normalizedUUID
+        selectedUUID = normalizedUUID
+        backups = AerialService.backups(for: normalizedUUID)
+        logReadiness("target selection changed")
     }
 
     func uuidFieldChanged() {
-        if let uuid = AerialService.normalizeUUID(uuidText) {
+        if let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) {
             if selectedUUID != uuid {
                 lastGeometryDiagnostic = nil
                 geometryDiagnosticURL = nil
@@ -387,11 +532,20 @@ final class AppModel: ObservableObject {
             }
             selectedUUID = uuid
             backups = AerialService.backups(for: uuid)
+        } else {
+            selectedUUID = ""
+            backups = []
         }
+        logReadiness("UUID field changed")
     }
 
     func requestProcessing() {
-        guard !isReidentifying else { return }
+        guard processingReadiness.canStart else {
+            let message = processingBlockMessage ?? "当前尚未满足处理条件。"
+            alertMessage = message
+            logger.write("[Readiness] request blocked reason=\(message)")
+            return
+        }
         guard let values = validatedProcessingValues() else { return }
         let target: URL
         do {
@@ -509,7 +663,12 @@ final class AppModel: ObservableObject {
     }
 
     func startProcessing() {
-        guard !isReidentifying else { return }
+        guard processingReadiness.canStart else {
+            showProcessConfirmation = false
+            alertMessage = processingBlockMessage ?? "当前尚未满足处理条件。"
+            logger.write("[Readiness] stale confirmation blocked")
+            return
+        }
         guard let values = validatedProcessingValues() else { return }
         guard let layout = pendingCropSelection else {
             alertMessage = "目标壁纸画布尚未准备完成，请重新点击“处理并替换”。"
@@ -536,7 +695,7 @@ final class AppModel: ObservableObject {
         archiveName: String?
     )? {
         guard let inputInfo,
-              let uuid = AerialService.normalizeUUID(uuidText) else {
+              let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) else {
             alertMessage = "请先选择视频，并输入有效的 Aerial UUID。"
             return nil
         }
@@ -786,7 +945,7 @@ final class AppModel: ObservableObject {
 
     func restoreSelectedBackup() {
         guard let backup = selectedBackup,
-              let uuid = AerialService.normalizeUUID(uuidText) else {
+              let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) else {
             alertMessage = "请选择一个备份文件。"
             return
         }
