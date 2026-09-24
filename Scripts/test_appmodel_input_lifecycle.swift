@@ -79,6 +79,19 @@ enum AppModelInputLifecycleSmoke {
         await wait(milliseconds: 100)
         require(!model.isInspectingVideo, "B success must clear inspecting state")
         require(model.inputInfo?.url.lastPathComponent == "input-b.mov", "B must become current input")
+        require(model.inputPathMatchesLoadedVideo, "B path must match the loaded video")
+
+        model.inputPath = inputA.path
+        require(model.hasUnloadedPath, "editing the path must mark the loaded input stale")
+        require(
+            model.processingBlockReason == .unloadedPath,
+            "processing must be blocked until the edited path is loaded"
+        )
+        require(!model.canStart, "an edited path must never allow processing of stale metadata")
+
+        model.inputPath = inputB.path
+        require(!model.hasUnloadedPath, "restoring the loaded path must clear the stale-path state")
+        require(model.inputPathMatchesLoadedVideo, "restoring B path must match loaded metadata")
 
         await wait(milliseconds: 250)
         require(!model.isInspectingVideo, "late A must not clear B's completed state")

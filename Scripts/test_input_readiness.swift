@@ -15,6 +15,7 @@ enum InputReadinessSmoke {
         let availableTarget = TargetAvailability.available
         let baseReadiness = ProcessingReadinessInput(
             inputLoaded: true,
+            inputPathNeedsLoad: false,
             isInspectingVideo: false,
             uuidValid: true,
             targetAvailability: availableTarget,
@@ -33,6 +34,11 @@ enum InputReadinessSmoke {
         require(
             ProcessingReadiness.evaluate(baseReadiness.with(inputLoaded: false)).blockReason == .noInput,
             "missing input must block with noInput"
+        )
+        require(
+            ProcessingReadiness.evaluate(baseReadiness.with(inputPathNeedsLoad: true)).blockReason
+                == .unloadedPath,
+            "a typed or edited path must block with unloadedPath"
         )
         require(
             ProcessingReadiness.evaluate(baseReadiness.with(isInspectingVideo: true)).blockReason == .inspectingVideo,
@@ -259,12 +265,14 @@ enum InputReadinessSmoke {
 
 extension ProcessingReadinessInput {
     func with(inputLoaded: Bool? = nil, isInspectingVideo: Bool? = nil,
+              inputPathNeedsLoad: Bool? = nil,
               uuidValid: Bool? = nil, targetAvailability: TargetAvailability? = nil,
               environmentChecking: Bool? = nil, environmentFailures: [String]? = nil,
               isProcessing: Bool? = nil, isPreparingLayout: Bool? = nil,
               isReidentifying: Bool? = nil) -> ProcessingReadinessInput {
         ProcessingReadinessInput(
             inputLoaded: inputLoaded ?? self.inputLoaded,
+            inputPathNeedsLoad: inputPathNeedsLoad ?? self.inputPathNeedsLoad,
             isInspectingVideo: isInspectingVideo ?? self.isInspectingVideo,
             uuidValid: uuidValid ?? self.uuidValid,
             targetAvailability: targetAvailability ?? self.targetAvailability,

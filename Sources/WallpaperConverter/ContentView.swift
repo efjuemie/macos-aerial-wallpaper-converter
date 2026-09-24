@@ -5,6 +5,7 @@ import AppKit
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    @State private var isVideoDropTargeted = false
 
     var body: some View {
         TabView {
@@ -115,35 +116,45 @@ struct ContentView: View {
 
     private var inputSection: some View {
         SectionCard(title: "1 · 选择视频", systemImage: "film") {
+            VideoDropZone(
+                isTargeted: $isVideoDropTargeted,
+                loadedFileName: model.inputInfo?.url.lastPathComponent,
+                isInspecting: model.isInspectingVideo,
+                onDrop: { providers in
+                    loadDroppedVideo(from: providers)
+                    return true
+                }
+            )
+
             HStack(spacing: 12) {
                 Image(systemName: "doc.badge.plus")
                     .font(.title2)
                     .foregroundStyle(Color.accentColor)
-                TextField("拖入视频，或输入 / 粘贴文件路径", text: $model.inputPath, onCommit: {
+                TextField("输入或粘贴本地视频路径", text: $model.inputPath, onCommit: {
                     model.loadVideoFromPathField()
                 })
                 .textFieldStyle(.roundedBorder)
+                .onChange(of: model.inputPath) { _ in
+                    model.inputPathDidChange()
+                }
+                Button("载入") {
+                    model.loadVideoFromPathField()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!model.canLoadPath)
                 Button("选择文件…") { model.chooseVideo() }
                     .buttonStyle(.borderedProminent)
             }
-            .padding(16)
-            .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(Color.accentColor.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [6]))
-            }
-            .onDrop(
-                of: [UTType.fileURL.identifier, UTType.url.identifier, UTType.text.identifier],
-                isTargeted: nil
-            ) { providers in
-                loadDroppedVideo(from: providers)
-                return true
-            }
 
-            if model.isInspectingVideo {
-                Label("正在读取视频信息…", systemImage: "hourglass")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if model.hasUnloadedPath {
+                Label(
+                    model.inputInfo == nil
+                        ? "路径已填入，请点击“载入”或按回车读取视频。"
+                        : "路径已修改，请点击“载入”或按回车重新读取视频。",
+                    systemImage: "arrow.uturn.down.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
 
             if let inputLoadError = model.inputLoadError {
@@ -151,6 +162,12 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
+            }
+
+            if model.isInspectingVideo {
+                Label("正在读取视频信息…", systemImage: "hourglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if let info = model.inputInfo {
@@ -175,11 +192,13 @@ struct ContentView: View {
             UTType.url.identifier,
             UTType.text.identifier
         ]
+        model.logInputUI("drop received providers=\(providers.count)")
 
         func loadProvider(at index: Int, lastError: String? = nil) {
             guard index < providers.count else {
                 let detail = lastError.map { "：\($0)" } ?? ""
                 DispatchQueue.main.async {
+                    model.logInputUI("drop failed providers=\(providers.count)")
                     model.recordInputLoadFailure("无法识别拖入的本地视频文件\(detail)")
                 }
                 return
@@ -198,6 +217,8 @@ struct ContentView: View {
                     switch DroppedVideoURLResolver.resolve(item) {
                     case let .success(url):
                         DispatchQueue.main.async {
+                            model.logInputUI("drop resolved file=\(url.lastPathComponent)")
+                            model.logInputUI("invoking loadVideo file=\(url.lastPathComponent)")
                             model.loadVideo(at: url)
                         }
                         return

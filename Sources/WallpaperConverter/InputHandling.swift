@@ -233,6 +233,7 @@ enum TargetSelectionPolicy {
 
 enum ProcessingBlockReason: Equatable, Sendable {
     case noInput
+    case unloadedPath
     case inspectingVideo
     case invalidUUID
     case targetUnavailable(TargetAvailability)
@@ -246,6 +247,8 @@ enum ProcessingBlockReason: Equatable, Sendable {
         switch self {
         case .noInput:
             return "请先拖入或选择一个本地视频。"
+        case .unloadedPath:
+            return "路径已填入但尚未载入，请点击“载入”或按回车读取视频。"
         case .inspectingVideo:
             return "正在读取视频信息…"
         case .invalidUUID:
@@ -268,6 +271,7 @@ enum ProcessingBlockReason: Equatable, Sendable {
 
 struct ProcessingReadinessInput: Equatable, Sendable {
     let inputLoaded: Bool
+    let inputPathNeedsLoad: Bool
     let isInspectingVideo: Bool
     let uuidValid: Bool
     let targetAvailability: TargetAvailability
@@ -304,6 +308,9 @@ enum ProcessingReadiness: Equatable, Sendable {
         }
         if input.isInspectingVideo {
             return .blocked(.inspectingVideo)
+        }
+        if input.inputPathNeedsLoad {
+            return .blocked(.unloadedPath)
         }
         if !input.inputLoaded {
             return .blocked(.noInput)

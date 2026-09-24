@@ -107,10 +107,35 @@ final class AppModel: ObservableObject {
         return TargetAvailability.evaluate(targetURL)
     }
 
+    /// True only when the editable path still points at the video whose
+    /// metadata is currently loaded. Keeping this separate from
+    /// inputInfo != nil prevents a path edit from accidentally processing
+    /// the previously loaded video.
+    var inputPathMatchesLoadedVideo: Bool {
+        guard let inputInfo,
+              case let .success(parsedURL) = VideoInputParser.parse(inputPath) else {
+            return false
+        }
+        return parsedURL.standardizedFileURL == inputInfo.url.standardizedFileURL
+    }
+
+    var hasUnloadedPath: Bool {
+        guard !isInspectingVideo else { return false }
+        return !inputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !inputPathMatchesLoadedVideo
+    }
+
+    var canLoadPath: Bool {
+        !inputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isProcessing
+            && !isInspectingVideo
+    }
+
     var processingReadiness: ProcessingReadiness {
         ProcessingReadiness.evaluate(
             ProcessingReadinessInput(
-                inputLoaded: inputInfo != nil,
+                inputLoaded: inputInfo != nil && inputPathMatchesLoadedVideo,
+                inputPathNeedsLoad: hasUnloadedPath,
                 isInspectingVideo: isInspectingVideo,
                 uuidValid: TargetSelectionPolicy.normalizeUUID(uuidText) != nil,
                 targetAvailability: selectedTargetAvailability,
@@ -153,14 +178,22 @@ final class AppModel: ObservableObject {
             .filter { $0.blocksProcessing }
             .map { $0.name }
             .joined(separator: ",")
-        logger.write(
-            "[Readiness] event=\(event) canStart=\(input.canStart) reason=\(reason) " +
-            "inputLoaded=\(inputInfo != nil) inspecting=\(isInspectingVideo) " +
-            "uuid=\(uuidText) targetAvailability=\(selectedTargetAvailability) " +
-            "environmentChecking=\(isEnvironmentChecking) " +
-            "blockingEnvironment=\(blockingEnvironment) " +
-            "processing=\(isProcessing) preparingLayout=\(isPreparingLayout) reidentifying=\(isReidentifying)"
-        )
+        let message = [
+            "[Readiness] event=\(event)",
+            "canStart=\(input.canStart)",
+            "reason=\(reason)",
+            "inputLoaded=\(inputInfo != nil && inputPathMatchesLoadedVideo)",
+            "inputPathNeedsLoad=\(hasUnloadedPath)",
+            "inspecting=\(isInspectingVideo)",
+            "uuid=\(uuidText)",
+            "targetAvailability=\(selectedTargetAvailability)",
+            "environmentChecking=\(isEnvironmentChecking)",
+            "blockingEnvironment=\(blockingEnvironment)",
+            "processing=\(isProcessing)",
+            "preparingLayout=\(isPreparingLayout)",
+            "reidentifying=\(isReidentifying)"
+        ].joined(separator: " ")
+        logger.write(message)
     }
 
     func refresh() {
@@ -314,6 +347,7 @@ final class AppModel: ObservableObject {
     }
 
     func loadVideoFromPathField() {
+        logInputUI("invoking loadVideo from path field")
         switch VideoInputParser.parse(inputPath) {
         case let .success(url):
             loadVideo(at: url)
@@ -330,6 +364,13 @@ final class AppModel: ObservableObject {
         case let .success(parsedURL):
             beginVideoInspection(parsedURL)
         }
+    }
+
+    func inputPathDidChange() {
+        // Editing a new path invalidates the previous transient parse error,
+        // but deliberately does not start inspection until the user submits
+        // the field or taps the explicit load button.
+        inputLoadError = nil
     }
 
     private func beginVideoInspection(_ url: URL) {
@@ -405,6 +446,10 @@ final class AppModel: ObservableObject {
         showCropSheet = false
         logger.write("Input load failed (details shown in UI)")
         logReadiness("input failure")
+    }
+
+    func logInputUI(_ event: String) {
+        logger.write("[InputUI] \(event)")
     }
 
     func cancelVideoInspection() {
