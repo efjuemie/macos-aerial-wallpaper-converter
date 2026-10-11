@@ -580,6 +580,7 @@ struct ContentView: View {
                     .padding(.top, 4)
                 }
             }
+            LockDiagnosticsView(model: model)
         }
     }
 

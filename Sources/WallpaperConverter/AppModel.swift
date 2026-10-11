@@ -7,6 +7,12 @@ private enum PreviewRefreshResult: Sendable {
     case failed(String)
 }
 
+private struct WallpaperReloadContext: Sendable {
+    let startedAt: Date
+    let executable: URL?
+    let skipped: Bool
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     static let defaultUUID = "00BA71CD-2C54-415A-A68A-8358E677D750"
@@ -54,6 +60,21 @@ final class AppModel: ObservableObject {
     @Published var lastGeometrySummary: String?
     @Published var lastGeometrySource: String?
     @Published var geometryPhenomenonChoice = "未观察"
+    @Published private(set) var operationRecords: [WallpaperOperationRecord] = []
+    @Published var lockSymptom: LockSymptom = .unknown
+    @Published var lockIncidentDateEnabled = false
+    @Published var lockIncidentDate = Date()
+    @Published var lockUserSettings: [String: String] = [
+        "screenSaverDelay": "",
+        "displayIdleOnBattery": "",
+        "displayIdleOnAC": "",
+        "passwordDelay": "",
+        "triggerCorners": "",
+        "lidClosed": ""
+    ]
+    @Published var lockBehaviorReport: LockBehaviorReport?
+    @Published var lockBehaviorReportURL: URL?
+    @Published var isCapturingLockDiagnostic = false
 
     static let geometryPhenomenonChoices = [
         "未观察",
@@ -65,19 +86,25 @@ final class AppModel: ObservableObject {
 
     private let logger = AppLogger()
     private let videoInspector: @Sendable (URL) async throws -> InputVideoInfo
+    private let operationTimeline: WallpaperOperationTimeline
     private var previewTask: Task<Void, Never>?
     private var environmentRefreshTask: Task<Void, Never>?
     private var videoInspectionTask: Task<Void, Never>?
     private var videoLoadState = VideoLoadStateMachine()
     private var pendingEnvironmentAction: EnvironmentAction?
+    private var lockDiagnosticTask: Task<Void, Never>?
+    private var lockDiagnosticGeneration = UUID()
 
     init(
         autoRefresh: Bool = true,
         videoInspector: @escaping @Sendable (URL) async throws -> InputVideoInfo = { url in
             try await VideoInspector.inspect(url)
-        }
+        },
+        operationTimeline: WallpaperOperationTimeline = WallpaperOperationTimeline()
     ) {
         self.videoInspector = videoInspector
+        self.operationTimeline = operationTimeline
+        self.operationRecords = operationTimeline.records
         if autoRefresh {
             refresh()
         }
@@ -196,6 +223,68 @@ final class AppModel: ObservableObject {
         logger.write(message)
     }
 
+    private func beginOperation(
+        kind: WallpaperOperationKind,
+        targetUUID: String?
+    ) -> WallpaperOperationRecord {
+        let record = operationTimeline.begin(kind: kind, targetUUID: targetUUID)
+        operationRecords = operationTimeline.records
+        logger.write("Operation started id=\(record.id.uuidString) kind=\(record.kind.rawValue) uuid=\(record.targetUUID ?? "none")")
+        return record
+    }
+
+    private func updateOperation(_ record: WallpaperOperationRecord) {
+        operationTimeline.update(record)
+        operationRecords = operationTimeline.records
+    }
+
+    private func finishOperation(
+        _ record: inout WallpaperOperationRecord,
+        error: Error? = nil
+    ) {
+        record.endTime = Date()
+        if let error {
+            record.errorMessage = WallpaperOperationTimeline.redactedError(error)
+            record.errorIsRedacted = true
+        }
+        updateOperation(record)
+    }
+
+    private func operationFailureMessage(
+        _ error: Error,
+        record: WallpaperOperationRecord
+    ) -> String {
+        var message = error.localizedDescription
+        guard record.rollbackAttempted else { return message }
+        if record.rollbackSucceeded == true, record.rollbackVerified == true {
+            message += "\n原壁纸已回滚，并通过 SHA-256 校验。"
+        } else {
+            message += "\n回滚未通过，请立即检查备份。"
+        }
+        return message
+    }
+
+    private func recordBackup(
+        _ record: inout WallpaperOperationRecord,
+        url: URL,
+        expectedSHA256: String?
+    ) throws {
+        record.backupCreated = true
+        do {
+            record.backupSHA256 = try AerialService.sha256(url)
+        } catch {
+            record.backupSHA256 = nil
+            record.backupVerified = false
+            updateOperation(record)
+            throw AppError("原壁纸备份无法校验，已停止安装。")
+        }
+        record.backupVerified = record.backupSHA256 == expectedSHA256
+        updateOperation(record)
+        guard record.backupVerified == true else {
+            throw AppError("原壁纸备份校验不一致，已停止安装。")
+        }
+    }
+
     func refresh() {
         environmentRefreshTask?.cancel()
         let hasCheckingStatus = environmentChecks.contains { $0.status == .checking }
@@ -308,10 +397,10 @@ final class AppModel: ObservableObject {
                     self.previewFailures.remove(entry.previewURL)
                 case .generated:
                     self.previewFailures.remove(entry.previewURL)
-                    self.logger.write("Preview generated archive=\(entry.url.path) preview=\(entry.previewURL.path)")
+                    self.logger.write("Preview generated archive=\(entry.url.lastPathComponent) preview=\(entry.previewURL.lastPathComponent)")
                 case let .failed(message):
                     self.previewFailures.insert(entry.previewURL)
-                    self.logger.write("Preview generation failed archive=\(entry.url.path): \(message)")
+                    self.logger.write("Preview generation failed archive=\(entry.url.lastPathComponent): \(message)")
                 }
             }
             guard !Task.isCancelled else { return }
@@ -419,7 +508,7 @@ final class AppModel: ObservableObject {
                 self.inputInfo = nil
                 self.inputLoadError = error.localizedDescription
                 _ = self.finishVideoInspection(generation)
-                self.logger.write("Input inspect failed file=\(url.lastPathComponent): \(error.localizedDescription)")
+                self.logger.write("Input inspect failed file=\(url.lastPathComponent): \(WallpaperOperationTimeline.redactedError(error))")
                 self.logReadiness("inspect failed")
             }
         }
@@ -528,6 +617,71 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func captureLockBehaviorDiagnostic() {
+        startLockBehaviorCapture(exportAfterCapture: false)
+    }
+
+    func exportLockBehaviorDiagnostic() {
+        startLockBehaviorCapture(exportAfterCapture: true)
+    }
+
+    func cancelLockBehaviorDiagnostic() {
+        lockDiagnosticGeneration = UUID()
+        lockDiagnosticTask?.cancel()
+        lockDiagnosticTask = nil
+        isCapturingLockDiagnostic = false
+        lockBehaviorReport = nil
+        lockBehaviorReportURL = nil
+    }
+
+    func openLockBehaviorReport() {
+        if let url = lockBehaviorReportURL {
+            NSWorkspace.shared.open(url)
+        } else {
+            alertMessage = "尚未导出意外锁屏诊断报告。"
+        }
+    }
+
+    private func startLockBehaviorCapture(exportAfterCapture: Bool) {
+        guard !isProcessing, !isCapturingLockDiagnostic else { return }
+        lockDiagnosticTask?.cancel()
+        let generation = UUID()
+        lockDiagnosticGeneration = generation
+        isCapturingLockDiagnostic = true
+        lockBehaviorReport = nil
+        lockBehaviorReportURL = nil
+        let incidentTime = lockIncidentDateEnabled ? lockIncidentDate : nil
+        let symptom = lockSymptom
+        let settings = lockUserSettings
+        let operations = operationRecords
+        lockDiagnosticTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let report = await LockBehaviorDiagnostics.capture(
+                reportedSymptom: symptom,
+                incidentTime: incidentTime,
+                userSettings: settings,
+                operations: operations
+            )
+            guard self.lockDiagnosticGeneration == generation, !Task.isCancelled else { return }
+            var updatedReport = report
+            if let persistenceWarning = self.operationTimeline.persistenceWarning {
+                updatedReport.warnings.append(persistenceWarning)
+            }
+            self.lockBehaviorReport = updatedReport
+            if exportAfterCapture {
+                do {
+                    let url = try LockBehaviorDiagnostics.export(updatedReport)
+                    self.lockBehaviorReportURL = url
+                    self.alertMessage = "意外锁屏诊断报告已导出：\n\(url.path)"
+                } catch {
+                    self.alertMessage = "无法导出意外锁屏诊断报告：\(WallpaperOperationTimeline.redactedError(error))"
+                }
+            }
+            self.isCapturingLockDiagnostic = false
+            self.lockDiagnosticTask = nil
+        }
+    }
+
     func reidentifyDownloadedOriginal() {
         guard !isProcessing, !isPreparingLayout, !isGeneratingGeometryDiagnostic, !isReidentifying else { return }
         guard let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) else {
@@ -585,6 +739,7 @@ final class AppModel: ObservableObject {
     }
 
     func requestProcessing() {
+        guard !isProcessing else { return }
         guard processingReadiness.canStart else {
             let message = processingBlockMessage ?? "当前尚未满足处理条件。"
             alertMessage = message
@@ -650,7 +805,7 @@ final class AppModel: ObservableObject {
             } catch {
                 pendingCropSelection = nil
                 alertMessage = error.localizedDescription
-                logger.write("Canvas preparation failed uuid=\(values.uuid): \(error.localizedDescription)")
+                logger.write("Canvas preparation failed uuid=\(values.uuid): \(WallpaperOperationTimeline.redactedError(error))")
             }
             isPreparingLayout = false
         }
@@ -708,6 +863,7 @@ final class AppModel: ObservableObject {
     }
 
     func startProcessing() {
+        guard !isProcessing else { return }
         guard processingReadiness.canStart else {
             showProcessConfirmation = false
             alertMessage = processingBlockMessage ?? "当前尚未满足处理条件。"
@@ -885,6 +1041,7 @@ final class AppModel: ObservableObject {
     }
 
     func requestArchiveReplacement() {
+        guard !isProcessing else { return }
         guard selectedArchive?.uuid != nil else {
             alertMessage = "该历史归档缺少目标 UUID，无法自动替换。"
             return
@@ -893,6 +1050,7 @@ final class AppModel: ObservableObject {
     }
 
     func quickReplaceSelectedArchive() {
+        guard !isProcessing else { return }
         guard let archive = selectedArchive,
               let uuid = archive.uuid else {
             alertMessage = "请选择包含目标 UUID 的历史壁纸。"
@@ -904,6 +1062,8 @@ final class AppModel: ObservableObject {
         lastReport = nil
         lastGeometryDiagnostic = nil
         geometryDiagnosticURL = nil
+        var record = beginOperation(kind: .historyReplacement, targetUUID: uuid)
+        var reloadGate = WallpaperOperationReloadGate()
 
         Task {
             do {
@@ -911,34 +1071,41 @@ final class AppModel: ObservableObject {
                 guard FileManager.default.isReadableFile(atPath: target.path) else {
                     throw AppError("目标动态壁纸不存在：\(target.path)")
                 }
+                let targetHash = try AerialService.sha256(target)
                 let currentBackup = try AerialService.createBackup(of: target, uuid: uuid, suffix: "before-history-restore")
-                let sourceHash = try AerialService.sha256(archive.url)
-                do {
-                    try AerialService.replaceAtomically(source: archive.url, target: target)
-                    guard sourceHash == (try AerialService.sha256(target)) else {
-                        throw AppError("安装后的历史壁纸校验失败。")
-                    }
-                } catch {
-                    try? AerialService.replaceAtomically(source: currentBackup, target: target)
-                    throw error
+                try recordBackup(&record, url: currentBackup, expectedSHA256: targetHash)
+                try WallpaperOperationSafety.install(
+                    record: &record,
+                    source: archive.url,
+                    target: target,
+                    backup: currentBackup,
+                    originalTargetSHA256: targetHash
+                )
+                updateOperation(record)
+                guard let reloadContext = beginReload(&record, gate: &reloadGate) else {
+                    throw AppError("同一次操作已执行过 WallpaperAgent 重载。")
                 }
-                let warning = await reloadWallpaperAgent()
+                let reload = await reloadWallpaperAgent(reloadContext)
+                applyReload(reload, to: &record)
+                finishOperation(&record)
                 backups = AerialService.backups(for: uuid)
                 lastReport = OperationReport(
                     uuid: uuid,
                     archiveURL: archive.url,
                     backupURL: currentBackup,
                     outputURL: archive.url,
-                    reloadWarning: warning,
+                    reloadWarning: reload.warning,
                     isRestore: true,
                     isArchiveReplacement: true
                 )
                 phase = .success
-                logger.write("History replacement uuid=\(uuid) archive=\(archive.url.path) backup=\(currentBackup.path)")
+                logger.write("History replacement id=\(record.id.uuidString) uuid=\(uuid) archive=\(archive.url.lastPathComponent) backup=\(currentBackup.lastPathComponent)")
             } catch {
-                phase = .failed(error.localizedDescription)
-                alertMessage = error.localizedDescription
-                logger.write("History replacement failure: \(error.localizedDescription)")
+                finishOperation(&record, error: error)
+                let visibleError = operationFailureMessage(error, record: record)
+                phase = .failed(visibleError)
+                alertMessage = visibleError
+                logger.write("History replacement failure id=\(record.id.uuidString): \(WallpaperOperationTimeline.redactedError(error))")
             }
             isProcessing = false
         }
@@ -954,21 +1121,33 @@ final class AppModel: ObservableObject {
             var messages: [String] = []
             let uid = String(getuid())
             let launchAgentLabel = "gui/\(uid)/com.local.wallpaper-aerial-fix"
+            let hasOldLaunchAgent = FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path)
             if let launchctl = CommandRunner.executable(named: "launchctl") {
-                let result = try? await CommandRunner.run(
-                    launchctl,
-                    arguments: ["bootout", launchAgentLabel]
-                )
-                if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path),
-                   result?.status != 0,
-                   let output = result?.output.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !output.isEmpty {
-                    messages.append("无法卸载旧 LaunchAgent：\(output)")
+                do {
+                    let result = try await CommandRunner.run(
+                        launchctl,
+                        arguments: ["bootout", launchAgentLabel]
+                    )
+                    if result.status != 0 {
+                        let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if result.status == 112 || result.status == 113 {
+                            messages.append("旧 LaunchAgent 未加载或已不存在（退出码 \(result.status)），无需卸载。")
+                        } else {
+                            let detail = output.isEmpty ? "退出码 \(result.status)" : output
+                            messages.append(
+                                "无法卸载旧 LaunchAgent：\(WallpaperOperationTimeline.redactedError(AppError(detail)))"
+                            )
+                        }
+                    }
+                } catch {
+                    messages.append(
+                        "无法卸载旧 LaunchAgent：\(WallpaperOperationTimeline.redactedError(error))"
+                    )
                 }
-            } else if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path) {
+            } else if hasOldLaunchAgent {
                 messages.append("未找到 launchctl，无法卸载旧 LaunchAgent 服务。")
             }
-            if FileManager.default.fileExists(atPath: AppPaths.oldLaunchAgent.path) {
+            if hasOldLaunchAgent {
                 do {
                     let destination = LaunchAgentPathPolicy.nextAvailableDestination(
                         preferred: AppPaths.oldLaunchAgentDisabled
@@ -980,15 +1159,24 @@ final class AppModel: ObservableObject {
                         )
                     }
                 } catch {
-                    messages.append("无法安全保存旧 LaunchAgent 配置：\(error.localizedDescription)")
+                    messages.append(
+                        "无法安全保存旧 LaunchAgent 配置：\(WallpaperOperationTimeline.redactedError(error))"
+                    )
                 }
             }
-            logger.write("Disabled old LaunchAgent; result=\(messages.joined(separator: " | "))")
+            if !messages.isEmpty {
+                let visible = messages.joined(separator: " | ")
+                alertMessage = visible
+                logger.write("Disabled old LaunchAgent; result=\(WallpaperOperationTimeline.redactedError(AppError(visible)))")
+            } else {
+                logger.write("Disabled old LaunchAgent; result=ok")
+            }
             refresh()
         }
     }
 
     func restoreSelectedBackup() {
+        guard !isProcessing else { return }
         guard let backup = selectedBackup,
               let uuid = TargetSelectionPolicy.normalizeUUID(uuidText) else {
             alertMessage = "请选择一个备份文件。"
@@ -997,19 +1185,31 @@ final class AppModel: ObservableObject {
         showRestoreConfirmation = false
         isProcessing = true
         phase = .running(number: 1, title: "恢复备份", detail: "正在备份当前壁纸并恢复所选版本…")
+        var record = beginOperation(kind: .backupRestore, targetUUID: uuid)
+        var reloadGate = WallpaperOperationReloadGate()
         Task {
             do {
                 let target = try AerialService.targetURL(uuid: uuid)
                 guard FileManager.default.fileExists(atPath: target.path) else {
                     throw AppError("目标 Aerial 文件不存在，无法恢复。")
                 }
+                let targetHash = try AerialService.sha256(target)
                 let currentBackup = try AerialService.createBackup(of: target, uuid: uuid, suffix: "before-restore")
-                try AerialService.replaceAtomically(source: backup.url, target: target)
-                guard try AerialService.sha256(backup.url) == AerialService.sha256(target) else {
-                    try? AerialService.replaceAtomically(source: currentBackup, target: target)
-                    throw AppError("恢复后的文件校验失败，已尝试恢复恢复前的文件。")
+                try recordBackup(&record, url: currentBackup, expectedSHA256: targetHash)
+                try WallpaperOperationSafety.install(
+                    record: &record,
+                    source: backup.url,
+                    target: target,
+                    backup: currentBackup,
+                    originalTargetSHA256: targetHash
+                )
+                updateOperation(record)
+                guard let reloadContext = beginReload(&record, gate: &reloadGate) else {
+                    throw AppError("同一次操作已执行过 WallpaperAgent 重载。")
                 }
-                let warning = await reloadWallpaperAgent()
+                let reload = await reloadWallpaperAgent(reloadContext)
+                applyReload(reload, to: &record)
+                finishOperation(&record)
                 backups = AerialService.backups(for: uuid)
                 selectedBackup = nil
                 lastReport = OperationReport(
@@ -1017,15 +1217,18 @@ final class AppModel: ObservableObject {
                     archiveURL: currentBackup,
                     backupURL: currentBackup,
                     outputURL: backup.url,
-                    reloadWarning: warning,
+                    reloadWarning: reload.warning,
                     isRestore: true,
                     isArchiveReplacement: false
                 )
                 phase = .success
-                logger.write("Restored backup=\(backup.url.path) target=\(target.path)")
+                logger.write("Restored backup id=\(record.id.uuidString) backup=\(backup.url.lastPathComponent) target=\(target.lastPathComponent)")
             } catch {
-                phase = .failed(error.localizedDescription)
-                alertMessage = error.localizedDescription
+                finishOperation(&record, error: error)
+                let visibleError = operationFailureMessage(error, record: record)
+                phase = .failed(visibleError)
+                alertMessage = visibleError
+                logger.write("Backup restore failure id=\(record.id.uuidString): \(WallpaperOperationTimeline.redactedError(error))")
             }
             isProcessing = false
         }
@@ -1039,6 +1242,7 @@ final class AppModel: ObservableObject {
         archiveName: String?,
         cropSelection: WallpaperCropSelection
     ) {
+        guard !isProcessing else { return }
         previewTask?.cancel()
         previewTask = nil
         isGeneratingPreviews = false
@@ -1053,12 +1257,15 @@ final class AppModel: ObservableObject {
         lastReport = nil
         lastGeometryDiagnostic = nil
         geometryDiagnosticURL = nil
+        var record = beginOperation(kind: .conversion, targetUUID: uuid)
+        var reloadGate = WallpaperOperationReloadGate()
 
         var didComplete = false
         Task {
             do {
                 let checks = await EnvironmentChecker.check()
                 guard !Task.isCancelled else {
+                    finishOperation(&record, error: AppError("处理任务已取消。"))
                     isProcessing = false
                     return
                 }
@@ -1074,14 +1281,14 @@ final class AppModel: ObservableObject {
                 progress = 2
 
                 phase = .running(number: 3, title: "读取视频信息", detail: "\(input.durationText)，\(input.width) × \(input.height)，循环 \(loopCount) 次。")
-                logger.write("Start input=\(input.url.path) uuid=\(uuid) duration=\(input.duration) loopCount=\(loopCount) bitrate=\(bitrate)")
+                logger.write("Start input=\(input.url.lastPathComponent) uuid=\(uuid) duration=\(input.duration) loopCount=\(loopCount) bitrate=\(bitrate)")
                 progress = 3
 
                 var geometryReport: GeometryDiagnosticReport?
                 do {
                     geometryReport = try await AerialService.diagnoseCurrentTarget(uuid: uuid, inputURL: input.url)
                 } catch {
-                    logger.write("Geometry diagnostic before encoding unavailable: \(error.localizedDescription)")
+                    logger.write("Geometry diagnostic before encoding unavailable: \(WallpaperOperationTimeline.redactedError(error))")
                 }
 
                 let aspectDetail = "按屏幕可见区域取景，并生成 \(cropSelection.outputWidth) × \(cropSelection.outputHeight) 的目标 Aerial 画布。"
@@ -1095,7 +1302,7 @@ final class AppModel: ObservableObject {
                     executable: encoder,
                     cropSelection: cropSelection
                 )
-                logger.write("Geometry validation output=\(output.path): \(geometryResult.validation)")
+                logger.write("Geometry validation output=\(output.lastPathComponent): \(geometryResult.validation)")
                 geometryReport?.intermediate = geometryResult.intermediate
                 geometryReport?.finalOutput = geometryResult.finalOutput
                 geometryReport?.finalOutputSHA256 = try? AerialService.sha256(output)
@@ -1112,7 +1319,9 @@ final class AppModel: ObservableObject {
                 }
 
                 phase = .running(number: 6, title: "归档原动态壁纸", detail: "正在保存到应用文件夹中的“壁纸”目录…")
+                let targetHash = try AerialService.sha256(target)
                 let backup = try AerialService.createBackup(of: target, uuid: uuid)
+                try recordBackup(&record, url: backup, expectedSHA256: targetHash)
                 let archive = try AerialService.archiveOriginal(of: target, uuid: uuid, customName: archiveName)
                 do {
                     try await PreviewService.generateFirstFrame(
@@ -1120,25 +1329,23 @@ final class AppModel: ObservableObject {
                         to: AerialService.previewURL(for: archive)
                     )
                 } catch {
-                    logger.write("Preview generation failed archive=\(archive.path): \(error.localizedDescription)")
+                    logger.write("Preview generation failed archive=\(archive.lastPathComponent): \(WallpaperOperationTimeline.redactedError(error))")
                 }
                 progress = 6
 
                 phase = .running(number: 7, title: "安装新视频", detail: "正在校验并安全替换目标文件…")
-                let sourceHash = try AerialService.sha256(output)
-                do {
-                    try AerialService.replaceAtomically(source: output, target: target)
-                    guard sourceHash == (try AerialService.sha256(target)) else {
-                        throw AppError("安装后的文件 SHA-256 校验不一致。")
-                    }
-                } catch {
-                    try? AerialService.replaceAtomically(source: backup, target: target)
-                    throw error
-                }
+                try WallpaperOperationSafety.install(
+                    record: &record,
+                    source: output,
+                    target: target,
+                    backup: backup,
+                    originalTargetSHA256: targetHash
+                )
+                updateOperation(record)
                 geometryReport?.installedTarget = await VideoGeometryService.diagnosticSnapshot(at: target)
                 let installedHash = try? AerialService.sha256(target)
                 geometryReport?.installedTargetSHA256 = installedHash
-                geometryReport?.outputMatchesInstalledTarget = installedHash == sourceHash
+                geometryReport?.outputMatchesInstalledTarget = installedHash == record.installedSHA256
                 if var report = geometryReport {
                     let originalProfile = GeometryDiagnostics.originalReferenceProfile(
                         chosenSource: report.chosenSource,
@@ -1170,7 +1377,7 @@ final class AppModel: ObservableObject {
                     do {
                         geometryDiagnosticURL = try GeometryDiagnostics.export(geometryReport)
                     } catch {
-                        logger.write("Geometry diagnostic export failed: \(error.localizedDescription)")
+                        logger.write("Geometry diagnostic export failed: \(WallpaperOperationTimeline.redactedError(error))")
                     }
                     logger.write(geometryReport.geometryLogSummary)
                 }
@@ -1179,20 +1386,25 @@ final class AppModel: ObservableObject {
                     encodedArchive = try AerialService.archiveEncodedOutput(output, uuid: uuid)
                 } catch {
                     encodedArchive = nil
-                    logger.write("Encoded history archive failed output=\(output.path): \(error.localizedDescription)")
+                    logger.write("Encoded history archive failed output=\(output.lastPathComponent): \(WallpaperOperationTimeline.redactedError(error))")
                 }
                 let historyOutput = encodedArchive ?? output
                 progress = 7
 
                 phase = .running(number: 8, title: "重载 WallpaperAgent", detail: "仅重载一次系统壁纸服务…")
-                let reloadWarning = await reloadWallpaperAgent()
+                guard let reloadContext = beginReload(&record, gate: &reloadGate) else {
+                    throw AppError("同一次操作已执行过 WallpaperAgent 重载。")
+                }
+                let reload = await reloadWallpaperAgent(reloadContext)
+                applyReload(reload, to: &record)
+                finishOperation(&record)
                 progress = 8
                 lastReport = OperationReport(
                     uuid: uuid,
                     archiveURL: archive,
                     backupURL: backup,
                     outputURL: historyOutput,
-                    reloadWarning: reloadWarning,
+                    reloadWarning: reload.warning,
                     isRestore: false,
                     isArchiveReplacement: false
                 )
@@ -1200,11 +1412,13 @@ final class AppModel: ObservableObject {
                 backups = AerialService.backups(for: uuid)
                 targets = AerialService.targets()
                 didComplete = true
-                logger.write("Success uuid=\(uuid) archive=\(archive.path) backup=\(backup.path) output=\(historyOutput.path) reloadWarning=\(reloadWarning ?? "none")")
+                logger.write("Success id=\(record.id.uuidString) uuid=\(uuid) archive=\(archive.lastPathComponent) backup=\(backup.lastPathComponent) output=\(historyOutput.lastPathComponent) reloadWarning=\(reload.warning ?? "none")")
             } catch {
-                phase = .failed(error.localizedDescription)
-                alertMessage = error.localizedDescription
-                logger.write("Failure: \(error.localizedDescription)")
+                finishOperation(&record, error: error)
+                let visibleError = operationFailureMessage(error, record: record)
+                phase = .failed(visibleError)
+                alertMessage = visibleError
+                logger.write("Failure id=\(record.id.uuidString): \(WallpaperOperationTimeline.redactedError(error))")
             }
             isProcessing = false
             if didComplete {
@@ -1273,17 +1487,120 @@ final class AppModel: ObservableObject {
         return AppPaths.processedDirectory.appendingPathComponent("\(uuid)-fixed-\(timestamp).mov")
     }
 
-    private func reloadWallpaperAgent() async -> String? {
-        guard let pkill = CommandRunner.executable(named: "pkill") else {
-            return "未找到 pkill，请在系统设置中重新选择壁纸。"
+    private func beginReload(
+        _ record: inout WallpaperOperationRecord,
+        gate: inout WallpaperOperationReloadGate
+    ) -> WallpaperReloadContext? {
+        guard gate.beginAttempt() else { return nil }
+        let context = WallpaperReloadContext(
+            startedAt: Date(),
+            executable: CommandRunner.executable(named: "pkill"),
+            skipped: Self.debugReloadIsSkipped
+        )
+        record.reloadStartedAt = context.startedAt
+        record.reloadExecutableAvailable = context.executable != nil
+        record.reloadSkipped = context.skipped
+        updateOperation(record)
+        return context
+    }
+
+    private func applyReload(
+        _ result: WallpaperAgentReloadResult,
+        to record: inout WallpaperOperationRecord
+    ) {
+        record.reloadStartedAt = result.startedAt
+        record.reloadEndedAt = result.endedAt
+        record.reloadExecutableAvailable = result.executableAvailable
+        record.reloadExitCode = result.exitCode
+        record.reloadSucceeded = result.succeeded
+        record.reloadSkipped = result.skipped
+        record.reloadErrorMessage = result.errorMessage
+        updateOperation(record)
+    }
+
+    private func reloadWallpaperAgent(
+        _ context: WallpaperReloadContext
+    ) async -> WallpaperAgentReloadResult {
+        if context.skipped {
+            return WallpaperAgentReloadResult(
+                warning: "Debug 实验已跳过自动重载，请在系统设置中手动重新选择壁纸。",
+                startedAt: context.startedAt,
+                endedAt: Date(),
+                executableAvailable: context.executable != nil,
+                exitCode: nil,
+                succeeded: nil,
+                skipped: true,
+                errorMessage: nil
+            )
+        }
+        guard let pkill = context.executable else {
+            return WallpaperAgentReloadResult(
+                warning: "未找到 pkill，请在系统设置中重新选择壁纸。",
+                startedAt: context.startedAt,
+                endedAt: Date(),
+                executableAvailable: false,
+                exitCode: nil,
+                succeeded: false,
+                skipped: false,
+                errorMessage: "未找到 pkill"
+            )
         }
         do {
             let result = try await CommandRunner.run(pkill, arguments: ["-x", "WallpaperAgent"])
-            if result.status == 0 { return nil }
-            if result.status == 1 { return "WallpaperAgent 当前未运行；请在系统设置中重新选择壁纸。" }
-            return "WallpaperAgent 重载命令返回状态 \(result.status)，请手动重新选择壁纸。"
+            if result.status == 0 {
+                return WallpaperAgentReloadResult(
+                    warning: nil,
+                    startedAt: context.startedAt,
+                    endedAt: Date(),
+                    executableAvailable: true,
+                    exitCode: result.status,
+                    succeeded: true,
+                    skipped: false,
+                    errorMessage: nil
+                )
+            }
+            if result.status == 1 {
+                return WallpaperAgentReloadResult(
+                    warning: "WallpaperAgent 当前未运行；请在系统设置中重新选择壁纸。",
+                    startedAt: context.startedAt,
+                    endedAt: Date(),
+                    executableAvailable: true,
+                    exitCode: result.status,
+                    succeeded: false,
+                    skipped: false,
+                    errorMessage: "WallpaperAgent 当前未运行"
+                )
+            }
+            return WallpaperAgentReloadResult(
+                warning: "WallpaperAgent 重载命令返回状态 \(result.status)，请手动重新选择壁纸。",
+                startedAt: context.startedAt,
+                endedAt: Date(),
+                executableAvailable: true,
+                exitCode: result.status,
+                succeeded: false,
+                skipped: false,
+                errorMessage: "WallpaperAgent 重载命令返回状态 \(result.status)"
+            )
         } catch {
-            return "WallpaperAgent 重载失败：\(error.localizedDescription)"
+            let message = WallpaperOperationTimeline.redactedError(error)
+            return WallpaperAgentReloadResult(
+                warning: "WallpaperAgent 重载失败：\(message)",
+                startedAt: context.startedAt,
+                endedAt: Date(),
+                executableAvailable: true,
+                exitCode: nil,
+                succeeded: false,
+                skipped: false,
+                errorMessage: message
+            )
         }
+    }
+
+    private static var debugReloadIsSkipped: Bool {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["WALLPAPER_CONVERTER_SKIP_RELOAD"] == "1"
+        #else
+        return false
+        #endif
     }
 }

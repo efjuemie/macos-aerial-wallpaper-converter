@@ -6,7 +6,7 @@
 
 ### 普通用户（推荐）
 
-普通用户无需 clone 源码。发行包发布在本仓库的 [Releases](https://github.com/efjuemie/macos-aerial-wallpaper-converter/releases) 页面，请下载与设备匹配的 Apple Silicon DMG 或 ZIP。`v0.8.4`（build 12）是 Finder 拖入载入状态修复预发布版本；它不会宣称已经在所有 Mac 上解决“进入桌面后被压扁”。
+普通用户无需 clone 源码。发行包发布在本仓库的 [Releases](https://github.com/efjuemie/macos-aerial-wallpaper-converter/releases) 页面，请下载与设备匹配的 Apple Silicon DMG 或 ZIP。`v0.8.5`（build 13）是意外锁屏诊断增强预发布版本；低概率意外锁屏仍待复现，尚未确认根因。
 
 安装步骤：
 
@@ -44,6 +44,16 @@
 8. 完成后在系统设置中重新点击对应动态壁纸，并在受影响的设备上连续完成至少 5 次“锁屏 → 解锁”，同时观察解锁后立即和等待约 5 秒后的桌面画面。
 
 桌面保持静态是 macOS 的正常现象；若出现黑屏、冻结或第二次不播放，请在应用中恢复备份。只有受影响设备完成上述 5 次循环且圆形、方形和人物比例均正常，才能把该设备视为回归通过；在此之前不要把 v0.8.4 当作完整桌面变形修复。
+
+## v0.8.5（build 13）排查意外锁屏
+
+在主界面展开“排查意外锁屏”，选择实际现象，按需填写大致发生时间和在系统设置中看到的选项，再点击“读取当前状态”或直接“导出报告”。报告写入 `~/Library/Application Support/WallpaperConverter/Diagnostics/`，文件名包含 `unexpected-lock` 和唯一标识，与几何报告分别保存。未取得系统日志、权限不足或设置不可读时仍可导出部分报告；缺失数据明确标为 `unavailable`，手填观察值标为 `userReported`。
+
+采集仅由用户主动触发：读取系统/电源快照和有限时间窗内的相关系统日志，有超时、取消及输出上限。应用退出后不继续采集；下一次打开时可以按观察时间回溯日志，系统已清理的日志无法恢复。报告还包含本应用近期转换、历史替换、备份恢复的操作时间线，记录安装、备份校验、回滚和 WallpaperAgent 单次重载结果。系统日志只能提示可能相关事件，不能证明应用导致锁屏。
+
+应用不会修改节能、屏保或安全设置，不安装后台进程，不自动上传。导出内容会进行脱敏，但系统日志和手填文字仍可能带有私人信息；分享前请自行打开 JSON 检查。现有“打开日志”和“打开诊断文件夹”仍可使用。
+
+低概率意外锁屏状态保持“待进一步复现”。本版不宣称已经修复，也不根据单台机器未复现排除 WallpaperAgent、系统设置或旧脚本的影响。完整审计、测试结果和真机对照方法见 [v0.8.5 验证记录](Docs/v0.8.5-validation.md)。
 
 ## v0.8.4（build 12）Finder 拖入载入修复预发布说明
 
@@ -189,6 +199,16 @@ Git、Python 3、Swift 和 Command Line Tools 位于折叠的“开发工具”�
 
 ## 常见问题
 
+### 为什么设置了永不锁屏还可能出现屏保或密码界面？
+
+请分别检查三项：屏幕保护程序多久启动、显示器在电池/外接电源下闲置多久关闭、屏保启动或显示器关闭后多久要求密码。“永不关闭显示器”不能代表“永不启动屏保”或“永不要求密码”。这些设置在不同 macOS 版本的位置和名称可能不同，可参考 Apple 的[锁定屏幕设置](https://support.apple.com/en-nz/guide/mac-help/mh11784/mac)和[屏幕保护程序设置](https://support.apple.com/en-au/guide/mac-help/mchlp1227/mac)。同时检查“桌面与程序坞 → 触发角”、合盖/睡眠及组织策略。
+
+再次出现时，先区分是否确实需要密码/Touch ID，还是移动鼠标便可退出屏保，或只是画面变黑/壁纸切换。在应用中记录最接近事件的时间并导出锁屏报告；设置无法可靠自动读取时请手填。若发现旧脚本，先保留报告，再通过应用已有“停用旧脚本”手动停用，保留配置后做前后对照。
+
+### 可以给屏保和桌面选择不同画面吗？
+
+可在系统设置中分别选择桌面墙纸与屏幕保护程序，具体位置依 macOS 版本而异。屏保与任何时刻的锁屏登录界面并不等同；本应用不提供“独立锁屏动态视频＋任意桌面静态图片”自动设置。Apple 的[屏保设置说明](https://support.apple.com/en-au/guide/mac-help/mchlp1227/mac)及公开的 [setDesktopImageURL API](https://developer.apple.com/documentation/appkit/nsworkspace/setdesktopimageurl(_:for:options:))分别描述屏保选择和桌面图片设置，未提供独立锁屏视频参数。
+
 ### 为什么没有动态壁纸可选？
 
 先在“系统设置 → 壁纸”下载并应用至少一个 Apple 动态壁纸，再点击“重新检测”。
@@ -207,7 +227,7 @@ Git、Python 3、Swift 和 Command Line Tools 位于折叠的“开发工具”�
 
 ### 为什么桌面不动或锁屏黑屏？
 
-请在系统设置中重新点击对应动态壁纸并连续测试 5 次锁屏→解锁，观察解锁后立即和约 5 秒后的桌面画面。若仍异常，先导出“几何诊断报告”，再在应用中恢复备份；不要运行常驻杀进程脚本。v0.8.4 仍是 Finder 拖入载入与此前诊断/裁剪交互预发布版本，尚不能据此宣称所有设备的桌面变形问题已经解决。
+请在系统设置中重新点击对应动态壁纸并连续测试 5 次锁屏→解锁，观察解锁后立即和约 5 秒后的桌面画面。若仍异常，先导出“几何诊断报告”，再在应用中恢复备份；不要运行常驻杀进程脚本。v0.8.5 延续此前诊断/裁剪行为，尚不能据此宣称所有设备的桌面变形问题已经解决。
 
 ### 如何反馈桌面压扁问题？
 
@@ -242,6 +262,8 @@ Scripts/package_release.sh
 
 Debug 构建可使用 `WALLPAPER_CONVERTER_FAKE_MISSING=encoder,aerial,diskSpace,git,python3,swiftc,clt,architecture,macos` 模拟缺失环境；Release 构建忽略该变量。
 
+开发者受控锁屏对照可在 Debug 构建启动时设置 `WALLPAPER_CONVERTER_SKIP_RELOAD=1`，安装成功后由测试者在系统设置手动重新选择壁纸。时间线会记录跳过重载；Release 忽略该变量，仍执行原有单次重载。详细实验矩阵见 [v0.8.5 验证记录](Docs/v0.8.5-validation.md)。
+
 如需检查视频画布元数据，可执行：
 
 ```bash
@@ -258,4 +280,4 @@ macOS 版 Wallpaper Engine 通常不能直接运行，可在 Windows 或 Windows
 
 ## 版本
 
-当前源码版本为 **0.8.4（build 12，Finder 拖入载入修复预发布）**，完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前源码版本为 **0.8.5（build 13，意外锁屏诊断增强预发布）**，完整记录见 [CHANGELOG.md](CHANGELOG.md)。
